@@ -1,0 +1,62 @@
+/* ==========================================================================
+   DragonExam — base styles
+   ========================================================================== */
+
+:root {
+  /* Color */
+  --color-bg: #8a2be2; /* bright energetic purple */
+  --color-box: #ff2b2b; /* red */
+
+  /* Type */
+  --font-body: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    Helvetica, Arial, sans-serif;
+  --font-size-body: 16px;
+  --line-height-body: 1.5;
+
+  /* Hero box */
+  --hero-box-width: 80vw; /* of the viewport's shorter constraint */
+  --hero-box-max-width: 1200px;
+  --hero-box-max-height: 80vh;
+}
+
+/* Reset ------------------------------------------------------------------ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  font-size: var(--font-size-body);
+  line-height: var(--line-height-body);
+  background-color: var(--color-bg);
+}
+
+/* Hero ------------------------------------------------------------------- */
+
+.hero {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  min-height: 100dvh; /* accounts for mobile browser chrome */
+}
+
+/* 16:9 box, centered, always fully visible inside the hero. Width is capped
+   by the viewport width *and* by the width implied by the max height, so the
+   ratio holds instead of the box being clipped on short viewports. */
+.hero__box {
+  width: min(
+    var(--hero-box-width),
+    var(--hero-box-max-width),
+    calc(var(--hero-box-max-height) * 16 / 9)
+  );
+  aspect-ratio: 16 / 9;
+  background-color: var(--color-box);
+}
