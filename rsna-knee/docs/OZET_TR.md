@@ -311,9 +311,26 @@ olmadan mimariye harcanan her saat, güvenemeyeceğiniz bir sayıya harcanmışt
 
 ```bash
 pip install -e ".[train,dev]"
-pytest -q                          # 131 test
+pytest -q                          # 196 test
 python scripts/99_smoke_test.py    # 10 aşamalı uçtan uca koşu, ~20 sn, sadece CPU
+
+# tüm eğitim yolunun kuru koşusu: veri yok, GPU yok, ~1 dk
+python scripts/04_train.py --synthetic --budget small --epochs-cap 2 \
+    --no-pretrained --device cpu --disable kd,ot_ground,weak_label
 ```
+
+Sıra: `00_build_manifest` → `01_make_folds` → `02_parse_reports --audit` →
+`04_train` → `05_oof_eval` → `06_ensemble`. Hepsinden önce
+`notebooks/kaggle_baseline.py`'ı Kaggle'a at — ağırlık gerektirmiyor, ~0.5 alıyor,
+ve karşılığında veri düzenini, DICOM tag sayımını ve I/O'nun 9 saatin ne kadarını
+yediğini söylüyor.
+
+**Bir güvenlik özelliği:** curriculum hesaplanamayacak bir terim planlarsa
+(`kd` var ama teacher logit yok gibi) eğitim **başlamıyor**, eksik alanı
+söyleyerek duruyor. Sessizce atlamak, daha küçük bir hedefi optimize edip loss
+eğrisini sağlıklı gösterirdi — ve tek belirti, üç GPU-günü sonra ablasyonla
+çelişen bir OOF skoru olurdu. Bilerek kapattığın terimleri `--disable` ile
+adlandırman gerekiyor ve run manifest'ine yazılıyorlar.
 
 Smoke test gerçek kod yolunu sürüyor — fold → collation → curriculum altında model
 ileri/geri → OOF değerlendirme → denetim paketi → ensembling → kalibrasyon →
@@ -326,14 +343,22 @@ conformal → submission. Stub yok.
 Geliştirme sırasında testler dört gerçek hata buldu; her biri düzeltildiği yerde
 kodda belgeli:
 
-1. **Kanonik yön çevirmesi** normal vektörü negatifliyor ama eski projeksiyonu
-   kullanıyordu → fiziksel koordinat azalan kalıyordu.
-2. **AUC-M'de koşullu ortalama** kullanımı → özdeşlik ~6 kat sapıyordu.
-3. **`np.nan_to_num` varsayılanı `+inf`'i 1.8e308'e** çeviriyor → Otsu'nun argmax'ı
-   her zaman son bin'i seçiyor, maske hiçbir şey seçmiyor ve sessizce percentile
-   fallback'ine düşüyordu (çalışıyormuş gibi görünüyordu).
-4. **`\b` alt çizgide bölmüyor** → `sag_pdw_fs_tse` yağ-baskısız olarak
-   sınıflanıyor, yanlış sequence family'ye ve yanlış attention önselına gidiyordu.
+| # | Hata | Neden önemliydi |
+|---|------|-----------------|
+| 1 | Kanonik yön çevirmesi normali negatifliyor ama eski projeksiyonu kullanıyordu | Fiziksel koordinat azalan kalıyordu |
+| 2 | AUC-M'de koşullu ortalama | Min-max özdeşliği ~6 kat sapıyordu |
+| 3 | `np.nan_to_num` `+inf`'i 1.8e308'e çeviriyor | Otsu'nun argmax'ı hep son bin'i seçiyor, maske sessizce fallback'e düşüyordu |
+| 4 | `\b` alt çizgide bölmüyor | `sag_pdw_fs_tse` yağ-baskısız sanılıyordu |
+| 5 | `build_submission` kendi sabit fallback'ini doğruluyordu | Dosya varlığını **garantileyen** güvenlik ağı exception atıyordu |
+| 6 | SNGP kovaryansı iki head çağrısı arasında in-place tazeliyordu | `backward()` version-counter hatasıyla düşüyordu |
+| 7 | `ConfidenceGate` boolean eşikleri "öğrenilebilir" işaretliyordu | Asla gradyan alamayacak parametreler |
+| 8 | `KneeOntology` `slots=True` altında tanımsız attribute atıyordu | Construct etmek exception atıyordu; hiç instantiate edilmemişti |
+| 9 | `normalise_text` casefold'un birleşen noktasını temizlediğini iddia ediyordu | Temizlemiyordu |
+| 10 | LID kana'dan önce CJK'yı kontrol ediyordu | Her Japonca rapor Çince etiketleniyordu |
 
-Bunların dördü de "şekil testi" ile yakalanamazdı. Test paketi şekil değil,
-**sayısal özellik** sabitler.
+Bunların hiçbiri "şekil testi" ile yakalanamazdı. Test paketi şekil değil,
+**sayısal özellik** sabitler. En belirleyicisi
+`test_model_can_overfit_a_tiny_dataset`: birleştirilmiş graf 12 çalışmayı
+macro-AUC 1.000'e sürüyor — gradyan yolunun loss'tan SNGP head, MoE router,
+ontoloji önselı, cross-sequence fusion, label query, aggregator, FiLM ve
+backbone boyunca sağlam olduğunun kanıtı.

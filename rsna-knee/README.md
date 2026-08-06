@@ -58,7 +58,7 @@ torch surface is lazily imported.
 ## Verify
 
 ```bash
-pytest -q                          # 131 tests
+pytest -q                          # 196 tests
 python scripts/99_smoke_test.py    # 10-stage end-to-end run, ~20 s, CPU only
 ```
 
@@ -70,14 +70,43 @@ stubs.
 ## Use
 
 ```bash
+# 0. scan the DICOM tree (headers only) -> manifest + QC + family census
+python scripts/00_build_manifest.py --root data/train --labels data/train_labels.csv \
+    --out artifacts/manifest.parquet --workers 8
+
+# 1. the immutable fold artefact.  Records a hash every checkpoint must carry.
 python scripts/01_make_folds.py --manifest artifacts/manifest.parquet \
     --out artifacts/folds --n-folds 5 --anneal-steps 60000
 
-python scripts/05_oof_eval.py --oof artifacts/oof/convnext_s.npz \
+# 2. reports -> four-state weak labels.  Run --audit FIRST and grow the lexicon.
+python scripts/02_parse_reports.py --reports data/train_reports.csv --audit --top 40
+python scripts/02_parse_reports.py --reports data/train_reports.csv \
+    --labels data/train_labels.csv --evaluate --out artifacts/weak_labels.parquet
+
+# 4. train one fold
+python scripts/04_train.py --folds artifacts/folds/folds.parquet \
+    --manifest artifacts/manifest.parquet --fold 0 --budget medium \
+    --out runs/convnext_s_f0
+
+# 5. evaluate + audit.  Exits non-zero on a blocking leakage failure.
+python scripts/05_oof_eval.py --oof runs/convnext_s_f0/oof.npz \
     --folds artifacts/folds/folds.parquet --report artifacts/reports/convnext_s.txt
 
-python scripts/06_ensemble.py --oof artifacts/oof/*.npz \
+# 6. ensemble.  Ships the uniform average unless the nested gain beats 1 SE.
+python scripts/06_ensemble.py --oof runs/*/oof.npz \
     --folds artifacts/folds/folds.parquet --out artifacts/ensemble
+```
+
+Before any of that, submit `notebooks/kaggle_baseline.py`: it needs no weights,
+scores ~0.5, and returns the three numbers that shape everything else — the real
+data layout, the DICOM tag census, and how much of the nine-hour budget I/O
+alone consumes.
+
+A one-command dry run of the whole training path, no data and no GPU:
+
+```bash
+python scripts/04_train.py --synthetic --budget small --epochs-cap 2 \
+    --no-pretrained --device cpu --disable kd,ot_ground,weak_label
 ```
 
 `notebooks/kaggle_inference.py` is the offline submission notebook: it writes a
@@ -97,6 +126,8 @@ src/kairos/
     folds.py              patient-safe multi-objective CV (iterative strat + annealing)
     dataset.py            DICOM → metric-resampled, robust-normalised 2.5D tensors
     sequence_taxonomy.py  (plane, weighting, fat-sat) from physics, not description
+    loader.py             Dataset + class-aware batch sampler with a rare quota
+    transforms.py         anatomy-safe augmentation; one affine per series
   text/ontology.py        multilingual knee lexicon, post-posed negation, compartments
   models/
     encoding.py           physical Fourier / rotary-in-mm / acquisition FiLM
@@ -114,7 +145,11 @@ src/kairos/
     multimodal.py         soft-target contrastive, decoupled KD, shortcut regulariser
     robust.py             Group-DRO (+SE shrinkage), CVaR, χ²-DRO, IRMv1
   optim/pesg.py           PESG min-max, ASAM, PCGrad/CAGrad/Aligned-MTL
-  train/                  five-stage curriculum, declarative loss schedule, trainer
+  train/
+    curriculum.py         five-stage schedule as a pure step -> weight function
+    objectives.py         curriculum term -> loss; REFUSES a schedule it cannot feed
+    ssl.py                masked feature modelling, cross-plane VICReg (stage S0)
+    loop.py               PESG/ASAM/EMA trainer, fold-hash-guarded checkpoints
   eval/
     metrics.py            DeLong (co)variance + paired test, patient-cluster bootstrap
     leakage.py            ten-audit shortcut suite, five of them blocking
@@ -149,11 +184,24 @@ ties scores and does change AUC.
 fallback first and degrades to coarse-only under budget pressure rather than
 overrunning.
 
+**A scheduled objective that cannot be computed is a hard error.** If the
+curriculum activates `kd` and the dataloader emits no teacher logits, training
+stops with a message naming the missing field. Skipping it silently would train
+a strictly smaller objective while the loss curve looked healthy — and the only
+symptom would arrive three GPU-days later as an OOF score that contradicts the
+ablation. Terms you omit on purpose must be named with `--disable`, and they are
+recorded in the run manifest.
+
 ---
 
 ## Tests
 
-131 tests, pinning numerics rather than shapes. A selection of what they check:
+196 tests, pinning numerics rather than shapes. The decisive one is
+`test_model_can_overfit_a_tiny_dataset`: the assembled graph drives 12 studies to
+macro-AUC 1.000, which is what proves the gradient path is intact from the loss
+back through the SNGP head, the MoE router, the ontology prior, the
+cross-sequence fusion, the label queries, the aggregator, the FiLM conditioning
+and the backbone. A selection of the rest:
 
 - AUC-M equals `p(1-p)·E[(m − h(x⁺) + h(x⁻))²]` at the saddle point
 - DeLong's SE agrees with a 1500-replicate bootstrap to within 20 %
@@ -172,13 +220,28 @@ overrunning.
 - Robust normalisation is invariant to affine intensity rescaling and survives
   a metal artefact
 - Every audit fires on a deliberately planted defect and stays quiet otherwise
+- Real DICOM written with pydicom and read back: geometric ordering beats a
+  misleading `InstanceNumber`, plane comes from geometry not description,
+  laterality mirrors, QC flags fire on a planted gap
+- The schedule validator refuses a curriculum it cannot feed
+- Turkish post-posed negation, Japanese post-posed negation, and compartment
+  resolution all produce the right assertion
 
-Four real bugs were found by these tests during development and are documented
-in the code at the site of each fix: a canonical-flip sign error that left the
-physical coordinate decreasing; the class-conditional-vs-batch-mean error in
-AUC-M (a factor of ~6); `np.nan_to_num` mapping `+inf` to 1.8e308 so Otsu's
-argmax always chose the last bin; and `\b` not splitting on `_`, which made
-`sag_pdw_fs_tse` classify as non-fat-suppressed.
+Ten real bugs were found by these tests during development, each documented in
+the code at the site of its fix:
+
+| bug | why it mattered |
+|---|---|
+| canonical-flip negated the normal but reused the old projection | physical coordinate came back decreasing |
+| AUC-M used class-conditional means | broke the min-max identity by ~6× |
+| `np.nan_to_num` maps `+inf` to 1.8e308 | Otsu's argmax always chose the last bin; mask silently fell through |
+| `\b` does not split on `_` | `sag_pdw_fs_tse` classified as non-fat-suppressed |
+| `build_submission` validated its own constant fallback | the safety net that guarantees a file *raised* |
+| SNGP refreshed its covariance in place between two head calls | backward failed with a version-counter error |
+| `ConfidenceGate` marked hard-boolean thresholds learnable | parameters that can never receive gradient |
+| `KneeOntology` assigned an undeclared attribute under `slots=True` | constructing it raised; nothing had instantiated it |
+| `normalise_text` claimed to strip the casefold combining dot | it did not |
+| LID checked CJK before kana | every Japanese report labelled Chinese |
 
 ---
 
