@@ -43,9 +43,7 @@ import numpy as np
 import pandas as pd
 
 T0 = time.monotonic()
-COMP_DIR = Path(os.environ.get(
-    "KAIROS_COMP_DIR", "/kaggle/input/rsna-knee-abnormality-detection"
-))
+COMP_DIR = os.environ.get("KAIROS_COMP_DIR") or None
 N_PROFILE = int(os.environ.get("KAIROS_N_PROFILE", 24))
 TIME_BUDGET_S = 9 * 3600
 
@@ -66,6 +64,7 @@ for d in ("/kaggle/input/kairos-code/src", "/kaggle/working/rsna-knee/src",
 try:
     from kairos.constants import TARGETS
     from kairos.infer.submission import build_submission, validate_submission
+    from kairos.io.layout import discover
     HAVE_KAIROS = True
 except Exception:
     HAVE_KAIROS = False
@@ -81,6 +80,14 @@ except Exception:
 rule("1. WHAT IS ACTUALLY IN THE INPUT DIRECTORY")
 # --------------------------------------------------------------------------- #
 
+if HAVE_KAIROS:
+    LAYOUT = discover(COMP_DIR)
+    COMP_DIR = LAYOUT.root
+    log(LAYOUT.describe())
+else:
+    LAYOUT = None
+    COMP_DIR = Path(COMP_DIR or "/kaggle/input/competitions/rsna-knee-abnormality-detection")
+
 if not COMP_DIR.exists():
     log(f"FATAL: {COMP_DIR} does not exist.")
     log("Attach the competition dataset, or set KAIROS_COMP_DIR.")
@@ -95,7 +102,7 @@ for p in top[:30]:
 if len(top) > 30:
     log(f"  ... and {len(top) - 30} more")
 
-for csv in sorted(COMP_DIR.glob("*.csv"))[:6]:
+for csv in sorted(COMP_DIR.glob("*.csv")):
     try:
         df = pd.read_csv(csv, nrows=5)
         log(f"\n  {csv.name}: {list(df.columns)[:16]}")
@@ -108,13 +115,12 @@ for csv in sorted(COMP_DIR.glob("*.csv"))[:6]:
 rule("2. TEST SET AND SUBMISSION TEMPLATE")
 # --------------------------------------------------------------------------- #
 
-sample = None
-for name in ("sample_submission.csv", "sample_submission.csv.zip"):
-    p = COMP_DIR / name
-    if p.exists():
-        sample = pd.read_csv(p)
-        log(f"sample_submission: {len(sample)} rows, {len(sample.columns)} columns")
-        break
+ss_path = (LAYOUT.sample_submission if LAYOUT else None) or (
+    COMP_DIR / "sample_submission.csv" if (COMP_DIR / "sample_submission.csv").exists() else None
+)
+sample = pd.read_csv(ss_path) if ss_path else None
+if sample is not None:
+    log(f"sample_submission: {len(sample)} rows, {len(sample.columns)} columns")
 
 if sample is None:
     cand = [d for d in COMP_DIR.iterdir() if d.is_dir() and d.name.lower().startswith("test")]
@@ -147,12 +153,13 @@ log("      Scale every timing below by the ratio you expect, not by 1.")
 rule("3. STUDY LAYOUT — how are series and slices nested?")
 # --------------------------------------------------------------------------- #
 
-test_root = None
-for cand in ("test_images", "test", "images/test", "test_series"):
-    p = COMP_DIR / cand
-    if p.exists() and p.is_dir():
-        test_root = p
-        break
+test_root = LAYOUT.test_images if LAYOUT else None
+if test_root is None:
+    for cand in ("test_series", "test_images", "test"):
+        p = COMP_DIR / cand
+        if p.is_dir():
+            test_root = p
+            break
 if test_root is None:
     dirs = [d for d in COMP_DIR.iterdir() if d.is_dir()]
     test_root = dirs[0] if dirs else COMP_DIR
@@ -389,6 +396,8 @@ Path("baseline_probe.json").write_text(json.dumps({
         if timings["headers"] else None
     ),
     "reports_present": bool(report_hits),
+    "csvs": {p.name: list(pd.read_csv(p, nrows=1).columns)
+             for p in sorted(COMP_DIR.glob("*.csv"))},
 }, indent=2))
 
 rule(f"BASELINE COMPLETE in {(time.monotonic() - T0) / 60:.1f} min")

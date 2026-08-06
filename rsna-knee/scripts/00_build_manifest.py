@@ -157,6 +157,34 @@ def scan_study(args) -> list[dict]:
     return rows
 
 
+def _merge_coalescing(left, right, *, on: str):
+    """Left-join, filling rather than duplicating columns that appear in both.
+
+    ``train.csv`` carries ``PatientID`` and so does the DICOM rollup.  A plain
+    ``merge`` renames both to ``PatientID_x`` / ``PatientID_y``, and the next
+    stage -- which needs ``PatientID`` to group folds by patient -- dies with a
+    bare ``KeyError``.  Worse, if it did not die, a surrogate group column would
+    silently split a patient across folds.
+
+    So: keep the left value where it is present, fall back to the right, and
+    leave a single column with the original name.
+    """
+    import pandas as pd
+
+    shared = [c for c in right.columns if c in left.columns and c != on]
+    merged = left.merge(right, on=on, how="left", suffixes=("", "__rhs"))
+    for c in shared:
+        rhs = f"{c}__rhs"
+        if rhs not in merged.columns:
+            continue
+        lhs_empty = merged[c].isna() | (merged[c].astype(str).str.strip() == "")
+        merged[c] = merged[c].where(~lhs_empty, merged[rhs])
+        merged = merged.drop(columns=[rhs])
+    if shared:
+        print(f"note: coalesced overlapping column(s) {shared} from {on}-join")
+    return merged
+
+
 def write_table(df, path: Path) -> Path:
     """Write parquet, falling back to CSV when no parquet engine is installed.
 
@@ -277,7 +305,7 @@ def main() -> int:
         missing = [t for t in TARGETS if t not in lab.columns]
         if missing:
             print(f"!! labels CSV missing target columns: {missing}", file=sys.stderr)
-        studies_df = studies_df.merge(lab, on="StudyInstanceUID", how="left")
+        studies_df = _merge_coalescing(studies_df, lab, on="StudyInstanceUID")
         have = studies_df[list(set(TARGETS) & set(studies_df.columns))].notna().all(axis=1)
         print(f"\nlabelled studies: {int(have.sum())}/{len(studies_df)}")
 

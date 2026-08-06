@@ -58,7 +58,7 @@ torch surface is lazily imported.
 ## Verify
 
 ```bash
-pytest -q                          # 196 tests
+pytest -q                          # 212 tests
 python scripts/99_smoke_test.py    # 10-stage end-to-end run, ~20 s, CPU only
 ```
 
@@ -69,9 +69,26 @@ stubs.
 
 ## Use
 
+The competition layout, confirmed on Kaggle and encoded in `kairos/io/layout.py`:
+
+```
+/kaggle/input/competitions/rsna-knee-abnormality-detection/
+    train.csv  test.csv                 study-level
+    train_series.csv  test_series.csv   series-level
+    sample_submission.csv
+    {train,test}_series/<StudyInstanceUID>/<SeriesInstanceUID>/<SOPInstanceUID>.dcm
+```
+
+Note the two traps: the root is under `input/competitions/`, and the images are
+in `{split}_series/` with `{split}.csv` sitting right beside it. Discovery lives
+in one module so those two facts cannot drift between the notebooks and the
+scripts.
+
 ```bash
 # 0. scan the DICOM tree (headers only) -> manifest + QC + family census
-python scripts/00_build_manifest.py --root data/train --labels data/train_labels.csv \
+python scripts/00_build_manifest.py \
+    --root /kaggle/input/competitions/rsna-knee-abnormality-detection/train_series \
+    --labels /kaggle/input/competitions/rsna-knee-abnormality-detection/train.csv \
     --out artifacts/manifest.parquet --workers 8
 
 # 1. the immutable fold artefact.  Records a hash every checkpoint must carry.
@@ -121,7 +138,9 @@ and validates the file it wrote.
 ```
 src/kairos/
   constants.py            12 targets, mechanism tree, compartments, 15 sequence families
-  io/geometry.py          slice ordering, canonical direction/laterality, QC, affines
+  io/
+    geometry.py           slice ordering, canonical direction/laterality, QC, affines
+    layout.py             competition file discovery (the two path traps, once)
   data/
     folds.py              patient-safe multi-objective CV (iterative strat + annealing)
     dataset.py            DICOM → metric-resampled, robust-normalised 2.5D tensors
@@ -196,7 +215,7 @@ recorded in the run manifest.
 
 ## Tests
 
-196 tests, pinning numerics rather than shapes. The decisive one is
+212 tests, pinning numerics rather than shapes. The decisive one is
 `test_model_can_overfit_a_tiny_dataset`: the assembled graph drives 12 studies to
 macro-AUC 1.000, which is what proves the gradient path is intact from the loss
 back through the SNGP head, the MoE router, the ontology prior, the
@@ -242,6 +261,11 @@ the code at the site of its fix:
 | `KneeOntology` assigned an undeclared attribute under `slots=True` | constructing it raised; nothing had instantiated it |
 | `normalise_text` claimed to strip the casefold combining dot | it did not |
 | LID checked CJK before kana | every Japanese report labelled Chinese |
+| `vars()` on a `slots=True` dataclass | fold writer raised *after* computing the split |
+| manifest/label merge collided on `PatientID` | became `PatientID_x`; the fold builder lost its group column |
+| optimiser never stepped when `len(loader) < accum_steps` | short folds and debug runs trained nothing |
+| the no-weights exit path validated its own constant fallback | second instance of the same safety-net bug |
+| `shuffled_label` used a fixed tolerance | false-alarmed on any small eval; a blocking audit that cries wolf gets ignored |
 
 ---
 

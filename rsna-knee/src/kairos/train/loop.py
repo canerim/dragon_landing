@@ -303,6 +303,46 @@ class Trainer:
         logs["loss/total"] = float(total.detach())
         return total, logs
 
+    def _optimizer_step(self, batch, weights, stage) -> dict[str, float]:
+        """One optimiser step: clip, step (PESG / ASAM / AdamW), EMA, project."""
+        logs: dict[str, float] = {}
+        gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+        logs["grad_norm"] = float(gn)
+        if not torch.isfinite(gn):
+            # A non-finite gradient must not be applied.  Dropping the step is
+            # strictly better than poisoning every parameter with NaN, and the
+            # counter makes the event visible instead of silent.
+            logs["grad_nonfinite"] = 1.0
+            self.opt.zero_grad(set_to_none=True)
+            if self.pesg is not None:
+                self.pesg.zero_grad(set_to_none=True)
+            return logs
+        if float(gn) > self.cfg.max_grad_norm_warn:
+            logs["grad_norm_spike"] = 1.0
+
+        if self.pesg is not None:
+            self.pesg.step()
+            self.pesg.zero_grad(set_to_none=True)
+            for term in self.loss_terms.values():
+                mod = getattr(term, "module", None)
+                if hasattr(mod, "project"):
+                    mod.project()
+        elif self.asam is not None:
+            self.asam.ascent_step()
+            with self._amp():
+                out2 = self.model(batch, update_precision=False)
+                l2, _ = self.compute_losses(out2, batch, weights)
+            (l2 / self.cfg.accum_steps).backward()
+            self.asam.descent_step()
+        else:
+            self.opt.step()
+            self.opt.zero_grad(set_to_none=True)
+
+        if self.ema is not None:
+            self.ema.update(self.model, decay=stage.ema_decay)
+        self.step += 1
+        return logs
+
     def train_epoch(self, loader) -> dict[str, float]:
         self.model.train()
         stage, _ = self.plan.stage_at(self.step)
@@ -315,6 +355,7 @@ class Trainer:
 
         agg: dict[str, float] = {}
         n = 0
+        pending = False
         t0 = time.time()
 
         for i, batch in enumerate(loader):
@@ -329,40 +370,26 @@ class Trainer:
 
             loss.backward()
 
+            pending = True
             if (i + 1) % self.cfg.accum_steps == 0:
-                gn = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.cfg.grad_clip
-                )
-                logs["grad_norm"] = float(gn)
-                if float(gn) > self.cfg.max_grad_norm_warn:
-                    logs["grad_norm_spike"] = 1.0
-
-                if self.pesg is not None:
-                    self.pesg.step()
-                    self.pesg.zero_grad(set_to_none=True)
-                    for term in self.loss_terms.values():
-                        mod = getattr(term, "module", None)
-                        if hasattr(mod, "project"):
-                            mod.project()
-                elif self.asam is not None:
-                    self.asam.ascent_step()
-                    with self._amp():
-                        out2 = self.model(batch, update_precision=False)
-                        l2, _ = self.compute_losses(out2, batch, weights)
-                    (l2 / self.cfg.accum_steps).backward()
-                    self.asam.descent_step()
-                else:
-                    self.opt.step()
-                    self.opt.zero_grad(set_to_none=True)
-
-                if self.ema is not None:
-                    self.ema.update(self.model, decay=stage.ema_decay)
-                self.step += 1
+                logs.update(self._optimizer_step(batch, weights, stage))
+                pending = False
 
             logs["lr_mult"] = lr_mult
             for k, v in logs.items():
                 agg[k] = agg.get(k, 0.0) + v
             n += 1
+
+        # Flush a partial accumulation cycle.  Without this, an epoch whose
+        # batch count is not a multiple of accum_steps discards its trailing
+        # gradients -- and when the loader is *shorter* than accum_steps (a
+        # small fold, a debug run, the last shard of a sharded dataset) the
+        # optimiser never steps at all and the run silently trains nothing.
+        if pending and n:
+            tail = self._optimizer_step(batch, weights, stage)
+            for k, v in tail.items():
+                agg[k] = agg.get(k, 0.0) + v
+            agg["accum_flush"] = agg.get("accum_flush", 0.0) + 1
 
         self.epoch += 1
         out = {k: v / max(n, 1) for k, v in agg.items()}

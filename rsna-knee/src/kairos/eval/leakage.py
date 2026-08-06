@@ -146,27 +146,59 @@ def metadata_only_audit(
 
 def shuffled_label_audit(
     y: np.ndarray, scores: np.ndarray, *, seed: int = 0, n_rep: int = 20,
-    tolerance: float = 0.03,
+    tolerance: float = 0.03, min_studies: int = 50,
 ) -> AuditResult:
-    """Permuting the labels must give macro-AUC ≈ 0.5.
+    r"""Permuting the labels must give macro-AUC ≈ 0.5.
 
     If it does not, the evaluation harness is broken -- almost always a
     misalignment between the prediction rows and the label rows, which is the
     single most catastrophic and most easily missed bug in the pipeline.
+
+    The tolerance is **sample-size aware**, and that is not a detail.  Under the
+    null the per-permutation macro-AUC has standard deviation roughly
+    :math:`(12 N \bar p(1-\bar p))^{-1/2}`, so on a 20-study debug fold a single
+    permutation lands 0.15 away from 0.5 routinely.  A fixed ±0.03 tolerance
+    therefore fires on every small evaluation, and a blocking audit that cries
+    wolf is one that gets switched off -- which costs far more than the false
+    alarm it produced.  We widen to :math:`3\,\mathrm{SE}` of the permutation
+    mean when that exceeds the absolute tolerance, and say so in the detail.
+
+    Below ``min_studies`` the test is reported as *uninformative* rather than
+    passed or failed: it genuinely cannot distinguish a broken harness from
+    noise, and claiming otherwise in either direction is worse than abstaining.
     """
+    n = int(len(y))
     rng = np.random.default_rng(seed)
     vals = []
     for _ in range(n_rep):
-        perm = rng.permutation(len(y))
+        perm = rng.permutation(n)
         vals.append(macro_auc(y[perm], scores))
+    vals = np.asarray(vals, dtype=float)
     m = float(np.nanmean(vals))
+    sd = float(np.nanstd(vals))
+    se = sd / max(np.sqrt(max(np.isfinite(vals).sum(), 1)), 1e-9)
+    eff_tol = max(tolerance, 3.0 * se)
+
+    if n < min_studies:
+        return AuditResult(
+            name="shuffled_label",
+            passed=True,
+            value=m,
+            threshold=0.5,
+            blocking=False,
+            detail=f"UNINFORMATIVE: only {n} studies (need >= {min_studies}); "
+                   f"permutation sd {sd:.4f} swamps any real misalignment",
+        )
+
     return AuditResult(
         name="shuffled_label",
-        passed=abs(m - 0.5) < tolerance,
+        passed=abs(m - 0.5) < eff_tol,
         value=m,
         threshold=0.5,
         blocking=True,
-        detail=f"expect 0.5 ± {tolerance}; sd over {n_rep} perms {np.nanstd(vals):.4f}",
+        detail=f"expect 0.5 +/- {eff_tol:.4f} (n={n}, {n_rep} perms, "
+               f"sd {sd:.4f}, se {se:.4f})",
+        extra={"sd": sd, "se": se, "effective_tolerance": eff_tol, "n": n},
     )
 
 

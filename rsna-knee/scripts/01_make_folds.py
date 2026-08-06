@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -97,7 +98,10 @@ def main() -> int:
             {
                 "fold_hash": result.fold_hash,
                 "objective": result.objective,
-                "spec": vars(spec),
+                # asdict, not vars: FoldSpec is a slots dataclass and has
+                # no __dict__.  vars() raises here, after the split has
+                # already been computed.
+                "spec": asdict(spec),
                 "diagnostics": result.diagnostics,
                 "group_col": args.group_col,
                 "covariates": list(covariates),

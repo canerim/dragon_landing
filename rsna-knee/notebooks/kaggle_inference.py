@@ -43,7 +43,9 @@ import pandas as pd
 # Configuration                                                                #
 # --------------------------------------------------------------------------- #
 
-COMP_DIR = Path("/kaggle/input/rsna-knee-abnormality-detection")
+# Resolved by kairos.io.layout, which knows the real layout:
+#   input/competitions/<comp>/{train,test}_series/<study>/<series>/*.dcm
+COMP_DIR = Path(os.environ.get("KAIROS_COMP_DIR", "")) or None
 WEIGHTS_GLOBS = [
     "/kaggle/input/kairos-knee-weights*/**/*.pt",
     "/kaggle/input/kairos-*/**/*.pt",
@@ -70,8 +72,17 @@ for d in CODE_DIRS:
 from kairos.constants import TARGETS  # noqa: E402
 from kairos.infer.budget import RuntimeGovernor  # noqa: E402
 from kairos.infer.submission import build_submission, validate_submission  # noqa: E402
+from kairos.io.layout import discover  # noqa: E402
 
 NUM_TARGETS = len(TARGETS)
+
+LAYOUT = discover(COMP_DIR)
+log("layout:\n" + LAYOUT.describe())
+if not LAYOUT.ok:
+    log("FATAL: could not locate the test images or a UID source.")
+    sys.exit(1)
+COMP_DIR = LAYOUT.root
+TEST_IMAGES = LAYOUT.test_images
 
 
 # --------------------------------------------------------------------------- #
@@ -80,13 +91,15 @@ NUM_TARGETS = len(TARGETS)
 
 
 def read_sample_submission() -> pd.DataFrame:
-    for name in ("sample_submission.csv", "sample_submission.csv.zip"):
-        p = COMP_DIR / name
-        if p.exists():
-            return pd.read_csv(p)
-    # Fall back to enumerating the test directory.
-    test_dir = COMP_DIR / "test"
-    uids = sorted(p.name for p in test_dir.iterdir() if p.is_dir()) if test_dir.exists() else []
+    """UID set and row order for the submission, in decreasing order of trust."""
+    if LAYOUT.sample_submission is not None:
+        return pd.read_csv(LAYOUT.sample_submission)
+    if LAYOUT.test_csv is not None:
+        df = pd.read_csv(LAYOUT.test_csv)
+        col = next((c for c in df.columns if "study" in c.lower()), df.columns[0])
+        uids = df[col].astype(str).drop_duplicates().tolist()
+        return pd.DataFrame({"StudyInstanceUID": uids, **{t: 0.5 for t in TARGETS}})
+    uids = sorted(p.name for p in TEST_IMAGES.iterdir() if p.is_dir())
     if not uids:
         raise FileNotFoundError(f"cannot locate the test set under {COMP_DIR}")
     return pd.DataFrame({"StudyInstanceUID": uids, **{t: 0.5 for t in TARGETS}})
@@ -171,7 +184,15 @@ except Exception:
 
 if not MODELS:
     log("no usable models — keeping the fallback submission and exiting cleanly")
-    validate_submission("submission.csv", expected_uids=STUDY_UIDS)
+    # ``require_varying=False`` for the same reason it is off when the fallback
+    # is written: this file IS the constant fallback.  Validating it in strict
+    # mode raises on the way out of the one path whose entire purpose is to
+    # leave a valid file behind.
+    info = validate_submission(
+        "submission.csv", expected_uids=STUDY_UIDS, require_varying=False
+    )
+    log(f"fallback submission.csv kept: {info['n_rows']} rows, "
+        f"sha256 {info['sha256'][:16]}")
     sys.exit(0)
 
 # All members must come from the same split, or the ensemble weights (fitted on
@@ -226,7 +247,7 @@ def load_study(uid: str):
     """
     from kairos.data.dataset import build_inference_batch
 
-    return build_inference_batch(COMP_DIR / "test" / uid, device=DEVICE)
+    return build_inference_batch(TEST_IMAGES / uid, device=DEVICE)
 
 
 def predict_one(batch, escalation: float) -> np.ndarray:

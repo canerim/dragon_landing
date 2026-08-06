@@ -483,6 +483,32 @@ def test_submission_fills_from_sample_and_averages_duplicates(tmp_path):
     assert np.isclose(df.loc[df.StudyInstanceUID == "u3", "ACL"].item(), 0.5)
 
 
+def test_fallback_validation_path_used_by_the_notebook(tmp_path):
+    """Regression: the notebook's 'no models, exit cleanly' path also raised.
+
+    ``build_submission(..., allow_constant=True)`` was fixed once, but the
+    *separate* ``validate_submission`` call on the way out of the no-weights
+    branch was still strict -- so the branch whose only job is to leave a valid
+    file behind crashed after leaving it.
+    """
+    pytest.importorskip("pandas")
+    from kairos.infer.submission import (
+        SubmissionError,
+        build_submission,
+        validate_submission,
+    )
+
+    uids = [f"u{i}" for i in range(8)]
+    out = tmp_path / "submission.csv"
+    build_submission(uids, np.full((8, len(TARGETS)), 0.5), output_path=out,
+                     allow_constant=True)
+    with pytest.raises(SubmissionError):
+        validate_submission(out, expected_uids=uids)
+    info = validate_submission(out, expected_uids=uids, require_varying=False)
+    assert info["n_rows"] == 8
+    assert len(info["constant_columns"]) == len(TARGETS)
+
+
 def test_submission_rejects_nonfinite(tmp_path):
     from kairos.infer.submission import SubmissionError, build_submission
 

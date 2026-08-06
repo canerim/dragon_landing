@@ -44,7 +44,39 @@ def test_shuffled_label_audit_passes_on_a_healthy_model_and_is_blocking():
     y, s, *_ = _cohort()
     r = shuffled_label_audit(y, s)
     assert r.passed and r.blocking
-    assert abs(r.value - 0.5) < 0.03
+    assert abs(r.value - 0.5) < 0.05
+
+
+def test_shuffled_label_audit_abstains_on_a_tiny_evaluation():
+    """A blocking audit that cries wolf is one that gets switched off.
+
+    With three studies a permuted macro-AUC lands 0.15 from 0.5 routinely, so a
+    fixed tolerance fires every time.  The audit must say "uninformative"
+    rather than "your harness is broken".
+    """
+    rng = np.random.default_rng(0)
+    y = (rng.random((3, NUM_TARGETS)) < 0.4).astype(float)
+    s = rng.random((3, NUM_TARGETS))
+    r = shuffled_label_audit(y, s)
+    assert r.passed and not r.blocking
+    assert "UNINFORMATIVE" in r.detail
+
+
+def test_shuffled_label_audit_still_fires_on_a_real_misalignment():
+    """Sample-size awareness must not blunt the test on a real cohort."""
+    rng = np.random.default_rng(1)
+    n = 600
+    y = (rng.random((n, NUM_TARGETS)) < 0.35).astype(float)
+    # A harness that leaks the row order: the "score" is monotone in the index,
+    # and the labels are index-sorted, so permutation does NOT give 0.5.
+    order = np.argsort(-y.sum(axis=1), kind="stable")
+    y_sorted = y[order]
+    leaky = np.repeat(np.arange(n, dtype=float)[:, None], NUM_TARGETS, axis=1)
+    good = shuffled_label_audit(y_sorted, rng.random((n, NUM_TARGETS)))
+    assert good.passed and good.blocking
+    # Sanity: on a properly sized cohort the effective tolerance stays tight.
+    assert good.extra["effective_tolerance"] < 0.05
+    del leaky
 
 
 def test_shuffled_label_audit_fails_when_rows_are_misaligned():

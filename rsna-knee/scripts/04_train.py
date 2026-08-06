@@ -121,6 +121,9 @@ def main() -> int:
     ap.add_argument("--folds", type=Path, help="folds.parquet from 01_make_folds.py")
     ap.add_argument("--fold-json", type=Path, help="folds.json (defaults next to --folds)")
     ap.add_argument("--manifest", type=Path)
+    ap.add_argument("--images", type=Path,
+                    help="training image root; defaults to the discovered "
+                         "<root>/train_series")
     ap.add_argument("--fold", type=int, default=0)
     ap.add_argument("--out", type=Path, default=Path("runs/kairos"))
     ap.add_argument("--budget", choices=("small", "medium", "large"), default="medium")
@@ -192,12 +195,25 @@ def main() -> int:
         )
 
         from kairos.data.dataset import load_study
+        from kairos.io.layout import discover
 
-        root = Path(args.manifest).parent if args.manifest else Path(".")
+        # The images are under <root>/train_series/<study>/<series>/*.dcm, and
+        # <root>/train.csv sits next to it -- so a bare "<root>/train" guess
+        # finds nothing.  Discovery handles that in one place.
+        images = args.images
+        if images is None:
+            layout = discover()
+            images = layout.train_images
+        if images is None or not Path(images).is_dir():
+            ap.error(
+                "could not locate the training images; pass --images explicitly "
+                "(expected <root>/train_series/<StudyInstanceUID>/<SeriesInstanceUID>/*.dcm)"
+            )
+        images = Path(images)
+        print(f"training images: {images}")
 
         def load_fn(uid: str):
-            rec = load_study(root / "train" / uid, out_size=args.image_size)
-            return rec
+            return load_study(images / uid, out_size=args.image_size)
 
     train_idx = np.flatnonzero(fold_of != args.fold)
     val_idx = np.flatnonzero(fold_of == args.fold)
@@ -276,10 +292,18 @@ def main() -> int:
     if disabled:
         print(f"deliberately disabled terms: {sorted(disabled)}")
 
+    from dataclasses import asdict as _asdict
+
     manifest = RunManifest(
         run_id=f"{args.backbone}_f{args.fold}_{int(time.time())}",
-        git_commit=git_commit(), config=vars(args) | {"model": vars(mcfg)} if False else
-        {k: str(v) for k, v in vars(args).items()},
+        git_commit=git_commit(),
+        config={
+            "args": {k: str(v) for k, v in vars(args).items()},
+            # asdict, not vars: KairosConfig is a slots dataclass.
+            "model": _asdict(mcfg),
+            "train": _asdict(tcfg),
+            "curriculum": [s_.name for s_ in plan.stages],
+        },
         fold_hash=fold_hash, fold=args.fold, seed=args.seed,
         package_versions=package_versions(),
     )
@@ -304,7 +328,10 @@ def main() -> int:
         logits, targets, val_uids = trainer.predict(val_loader)
         if len(logits) == 0:
             continue
-        probs = 1.0 / (1.0 + np.exp(-logits))
+        # Stable sigmoid: exp(-logits) overflows for the large-magnitude
+        # negative logits an AUC-margin objective happily produces.
+        probs = np.where(logits >= 0, 1.0 / (1.0 + np.exp(-np.abs(logits))),
+                         np.exp(-np.abs(logits)) / (1.0 + np.exp(-np.abs(logits))))
         aucs = per_label_auc(targets, probs)
         macro = float(np.nanmean(aucs))
         worst = float(np.nanmin(aucs)) if np.isfinite(aucs).any() else float("nan")
