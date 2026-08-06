@@ -179,7 +179,24 @@ class GumbelTopKSelector(nn.Module):
 
 
 class ConfidenceGate(nn.Module):
-    r"""Per-(study, label) decision to escalate to the high-resolution pass."""
+    r"""Per-(study, label) decision to escalate to the high-resolution pass.
+
+    **The thresholds are calibrated, not learned, and that is deliberate.**
+    The gate's output is a hard boolean produced by comparison operators, so no
+    gradient can reach the thresholds through it -- marking them
+    ``requires_grad=True`` would create parameters that look trainable, never
+    move, and quietly inflate the parameter count.  (An earlier revision did
+    exactly that; a test asserting every parameter receives gradient caught it.)
+
+    They are instead set by :meth:`set_from_pareto` from the runtime--AUC
+    frontier computed on out-of-fold predictions -- which is both the right
+    objective, since the thing being traded is wall-clock against macro-AUC,
+    and the only one that can see runtime at all.
+
+    Passing ``learnable=True`` opts into gradient-carrying thresholds; it is
+    only meaningful together with a differentiable relaxation of the gate,
+    which this class does not provide.
+    """
 
     def __init__(
         self,
@@ -188,7 +205,7 @@ class ConfidenceGate(nn.Module):
         p_low: float = 0.05,
         p_high: float = 0.85,
         u_threshold: float = 0.5,
-        learnable: bool = True,
+        learnable: bool = False,
     ) -> None:
         super().__init__()
         init = torch.stack(

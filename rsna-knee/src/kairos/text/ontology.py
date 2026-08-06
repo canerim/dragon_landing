@@ -66,6 +66,13 @@ def normalise_text(text: str, *, fold_case: bool = True) -> str:
     t = t.replace("​", "").replace("﻿", "").replace("­", "")
     if fold_case:
         t = t.casefold()
+        # ``"İ".casefold()`` yields ``i`` + U+0307 COMBINING DOT ABOVE, which
+        # NFKC will not recombine.  Drop that one codepoint specifically: it is
+        # an artefact of case folding, not a diacritic anyone wrote.  Stripping
+        # marks wholesale would also destroy ü/ö/ç/ğ/ş, which *are* meaningful
+        # and which the lexicon relies on for display and for the non-folded
+        # comparison paths.
+        t = t.replace("̇", "")
     t = unicodedata.normalize("NFKC", t)
     return re.sub(r"\s+", " ", t).strip()
 
@@ -171,6 +178,12 @@ class KneeOntology:
     lexicon: dict[str, tuple[str, ...]] = field(default_factory=dict)
     negation_window: int = 8
     require_compartment: bool = True
+    #: Compiled per-label alternation, built in ``__post_init__``.  It must be
+    #: a declared field: with ``slots=True`` there is no ``__dict__``, so an
+    #: undeclared attribute cannot be assigned and construction fails outright.
+    _compiled: dict[str, "re.Pattern[str]"] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if not self.lexicon:

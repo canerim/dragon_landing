@@ -110,6 +110,33 @@ class StudyBatch:
     study_uid: list[str] | None = None
     fine_pixels: torch.Tensor | None = None  # (B, Nseq, S, C, Hf, Wf) if precomputed
 
+    # ---- optional supervision channels -------------------------------- #
+    # All default to None so a purely image-only batch is fully valid.  The
+    # objective registry checks for presence and the schedule validator refuses
+    # to start a run that *schedules* a term whose inputs are absent -- silently
+    # skipping a scheduled loss is how a training run comes back looking fine
+    # and being worthless.
+    weak_labels: torch.Tensor | None = None  # (B, L) soft targets from reports
+    weak_confidence: torch.Tensor | None = None  # (B, L) in [0, 1]
+    text_embedding: torch.Tensor | None = None  # (B, D_text) pooled report
+    graph_embedding: torch.Tensor | None = None  # (B, D_graph) concept graph
+    phrase_embedding: torch.Tensor | None = None  # (B, P, D_text)
+    phrase_mask: torch.Tensor | None = None  # (B, P) bool
+    phrase_label: torch.Tensor | None = None  # (B, P) long, -1 = no label
+    phrase_confidence: torch.Tensor | None = None  # (B, P)
+    has_report: torch.Tensor | None = None  # (B,) bool
+    teacher_logits: torch.Tensor | None = None  # (B, L) cross-fitted OOF teacher
+    teacher_attention: torch.Tensor | None = None  # (B, L, S_flat)
+    env_id: torch.Tensor | None = None  # (B,) environment for IRM
+
+    def to(self, device) -> "StudyBatch":
+        """Move every tensor field to ``device``, leaving ``None`` fields alone."""
+        for f in self.__slots__:
+            v = getattr(self, f, None)
+            if torch.is_tensor(v):
+                setattr(self, f, v.to(device, non_blocking=True))
+        return self
+
 
 class KairosModel(nn.Module):
     def __init__(self, cfg: KairosConfig) -> None:
@@ -343,6 +370,12 @@ class KairosModel(nn.Module):
             "logits": coarse_logits,
             "coarse_logits": coarse_logits,
             "z": z,
+            # Per-slice contextual tokens.  Exposed because the self-supervised
+            # stage regresses masked tokens against them and the phrase->slice
+            # OT loss transports onto them; recomputing either would double the
+            # backbone cost of those stages.
+            "slice_tokens": h.reshape(B, Nseq, S, -1),
+            "study_embedding": z.mean(dim=1),
             "slice_attention": attn.reshape(B, Nseq, L, S),
             "sequence_attention": seq_attn,
             **aux,

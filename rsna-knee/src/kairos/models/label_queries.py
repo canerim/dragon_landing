@@ -177,7 +177,11 @@ class CrossSequenceFusion(nn.Module):
                 norm_first=True,
                 activation="gelu",
             )
-            self.encoder = nn.TransformerEncoder(layer, num_layers=2)
+            # See the note in train/ssl.py: norm_first rules out the nested
+            # tensor fast path, so asking for it only produces a warning.
+            self.encoder = nn.TransformerEncoder(
+                layer, num_layers=2, enable_nested_tensor=False
+            )
         else:
             self.encoder = None
 

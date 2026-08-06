@@ -36,7 +36,7 @@ import math
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -134,6 +134,10 @@ class RunManifest:
     checkpoint_sha256: str | None = None
     best_macro_auc: float | None = None
     best_worst_label_auc: float | None = None
+    #: Objective terms deliberately switched off for this run.  Recorded so a
+    #: later comparison cannot mistake "we never trained that term" for "that
+    #: term did not help".
+    disabled_terms: list[str] = field(default_factory=list)
     notes: str = ""
 
     def write(self, path: Path) -> None:
@@ -164,6 +168,9 @@ class Trainer:
         loss_terms: Mapping[str, Callable],
         fold_hash: str,
         device: str | torch.device = "cpu",
+        sample_batch: object | None = None,
+        disabled_terms: Sequence[str] = (),
+        validate: bool = True,
     ) -> None:
         self.model = model
         self.plan = plan
@@ -172,12 +179,38 @@ class Trainer:
         self.loss_terms = dict(loss_terms)
         self.device = torch.device(device)
         self.fold_hash = fold_hash
+        self.disabled_terms = set(disabled_terms)
 
         if not fold_hash:
             raise ValueError(
                 "fold_hash is required: an OOF matrix that cannot be traced to a "
                 "split is not safe to ensemble"
             )
+
+        # Refuse to start when the curriculum schedules an objective that
+        # cannot be computed.  See train/objectives.py for why this is fatal
+        # rather than a warning: the run would otherwise optimise a strictly
+        # smaller objective and report a perfectly healthy loss curve.
+        if validate:
+            from .objectives import validate_schedule
+
+            filtered = {
+                k: v for k, v in self.loss_terms.items() if k not in self.disabled_terms
+            }
+            problems = validate_schedule(
+                filtered, self.schedule, sample_batch=sample_batch, strict=False
+            )
+            hard = [p for p in problems if p.split("'")[1] not in self.disabled_terms]
+            if hard:
+                from .objectives import MissingObjectiveError
+
+                raise MissingObjectiveError(
+                    "the curriculum schedules objectives that cannot be computed:\n"
+                    "  - " + "\n  - ".join(hard)
+                    + "\n\nEither supply the missing batch fields, or pass the term "
+                    "names in `disabled_terms` so the omission is recorded in the "
+                    "run manifest instead of being silent."
+                )
 
         groups = model.parameter_groups(
             backbone_lr=cfg.backbone_lr,
@@ -252,7 +285,7 @@ class Trainer:
         logs: dict[str, float] = {}
         state = {"step": self.step, "epoch": self.epoch, "weights": weights}
         for name, w in weights.items():
-            if w == 0.0:
+            if w == 0.0 or name in self.disabled_terms:
                 continue
             fn = self.loss_terms.get(name)
             if fn is None:
@@ -384,10 +417,13 @@ class Trainer:
             "config": asdict(self.cfg),
             "fold_hash": self.fold_hash,
             "targets": list(TARGETS),
+            "disabled_terms": sorted(self.disabled_terms),
+            "model_config": _model_config_dict(self.model),
         }
         torch.save(payload, path)
         sha = _sha256(path)
         manifest.checkpoint_sha256 = sha
+        manifest.disabled_terms = sorted(self.disabled_terms)
         manifest.finished_at = time.time()
         manifest.write(path.with_suffix(".manifest.json"))
         return sha
@@ -429,3 +465,22 @@ def suggest_accum(target_studies: int, per_device: int, world_size: int = 1) -> 
     studies even if that means 8 accumulation steps.
     """
     return max(1, math.ceil(target_studies / max(per_device * world_size, 1)))
+
+
+def _model_config_dict(model: nn.Module) -> dict:
+    """Serialise the model config so a checkpoint can be reloaded standalone.
+
+    The Kaggle notebook reads this to rebuild the architecture without needing
+    the training config file: a checkpoint that cannot describe its own
+    architecture is a checkpoint that will be loaded with the wrong one.
+    """
+    cfg = getattr(model, "cfg", None)
+    if cfg is None:
+        return {}
+    from dataclasses import asdict, is_dataclass
+
+    if not is_dataclass(cfg):
+        return {}
+    out = asdict(cfg)
+    # BackboneSpec is nested; asdict already flattened it into a plain dict.
+    return out

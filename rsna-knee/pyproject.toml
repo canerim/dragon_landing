@@ -18,6 +18,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: takes tens of seconds; the overfit wiring check lives here",
+]
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning",
