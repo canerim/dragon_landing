@@ -126,8 +126,8 @@ def test_auc_margin_handles_all_nan_and_single_class_labels():
 def test_soft_topk_sums_to_k_and_is_differentiable():
     s = torch.randn(50, requires_grad=True)
     w = soft_topk_weights(s, k=7.0, temperature=0.05)
-    assert abs(float(w.sum()) - 7.0) < 0.05
-    assert float(w.min()) >= 0.0 and float(w.max()) <= 1.0
+    assert abs(float(w.detach().sum()) - 7.0) < 0.05
+    assert float(w.detach().min()) >= 0.0 and float(w.detach().max()) <= 1.0
     w.sum().backward()
     assert s.grad is not None and torch.isfinite(s.grad).all()
 
@@ -299,12 +299,12 @@ def test_copula_learns_positive_correlation():
         loss = cop(logits, y)
         loss.backward()
         opt.step()
-    assert float(cop.correlation()[0, 1]) > 0.4
+    assert float(cop.correlation().detach()[0, 1]) > 0.4
 
 
 def test_copula_correlation_is_a_valid_correlation_matrix():
     cop = GaussianCopulaNLL(NUM_TARGETS, rank=4)
-    R = cop.correlation()
+    R = cop.correlation().detach()
     assert torch.allclose(torch.diagonal(R), torch.ones(NUM_TARGETS), atol=1e-4)
     assert torch.allclose(R, R.T, atol=1e-6)
     off = R - torch.eye(NUM_TARGETS)
@@ -395,8 +395,9 @@ def test_soft_contrastive_prefers_the_matched_pair_but_not_absolutely():
     txt = img.clone() + 0.01 * torch.randn(B, D)
     weak = (torch.rand(B, NUM_TARGETS) < 0.3).float()
     loss = SoftContrastive(alpha_identity=0.6, beta_jaccard=0.3, gamma_graph=0.0)
-    matched = loss(img, txt, weak_labels=weak)
-    shuffled = loss(img, txt[torch.randperm(B)], weak_labels=weak)
+    with torch.no_grad():
+        matched = loss(img, txt, weak_labels=weak)
+        shuffled = loss(img, txt[torch.randperm(B)], weak_labels=weak)
     assert float(matched) < float(shuffled)
 
 
@@ -422,13 +423,15 @@ def test_report_shortcut_regulariser_flags_a_text_only_model():
 def test_physical_positional_encoding_is_translation_sensitive_and_bounded():
     pe = PhysicalPositionalEncoding(64, min_period_mm=2.0, max_period_mm=240.0)
     z = torch.tensor([0.0, 3.0, 6.0, 100.0])
-    e = pe(z)
+    with torch.no_grad():
+        e = pe(z)
+        same = pe(torch.tensor([3.0]))[0]
     assert e.shape == (4, 64)
     assert float(e.abs().max()) <= 1.0 + 1e-6
     # Distinct physical positions must get distinct codes.
     assert float((e[0] - e[1]).abs().sum()) > 1.0
     # Same physical position, different index -> identical code.
-    assert torch.allclose(pe(torch.tensor([3.0]))[0], e[1], atol=1e-6)
+    assert torch.allclose(same, e[1], atol=1e-6)
 
 
 def test_slice_transformer_ignores_padded_slices():

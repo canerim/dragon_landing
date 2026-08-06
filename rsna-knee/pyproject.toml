@@ -18,4 +18,13 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-filterwarnings = ["ignore::DeprecationWarning"]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning",
+    # Tests assert on scalars taken from grad-carrying tensors, e.g.
+    # ``assert float(loss(z, y)) < ...``.  torch warns because in *library*
+    # code that usually signals an accidental graph detach; in an assertion it
+    # is harmless and wrapping every one in ``no_grad`` obscures what is being
+    # checked.  Scoped to the test suite only -- library code must stay clean.
+    "ignore:Converting a tensor with requires_grad:UserWarning",
+]

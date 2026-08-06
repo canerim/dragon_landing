@@ -1,0 +1,193 @@
+# KAIROS
+
+**K**nee **A**bnormality **I**nference with **R**eport-**O**ptimised **S**upervision
+— a system for the [RSNA Knee Abnormality Detection](https://www.kaggle.com/competitions/rsna-knee-abnormality-detection) challenge (Kaggle, 2026).
+
+Twelve clinically defined abnormalities on knee MRI, from sixteen centres across
+five continents, each study paired with its original radiology report in one of
+~twelve languages. Metric: macro-average ROC-AUC over the twelve targets.
+
+- **Method:** [`docs/DESIGN.md`](docs/DESIGN.md) — the full specification, with derivations.
+- **Turkish summary:** [`docs/OZET_TR.md`](docs/OZET_TR.md)
+
+---
+
+## What this is
+
+Six claims, each implemented and each falsifiable on out-of-fold data:
+
+1. **This is a domain-generalisation problem.** Sixteen centres and an unknown
+   private site mix mean ERM optimises the wrong functional. We optimise a
+   distributionally-robust objective and treat the *site AUC gap* as a headline
+   metric, not a diagnostic.
+2. **Physical geometry, not array indices.** Slice order from
+   `ImagePositionPatient` projected on the slice normal; positional encoding as
+   a Fourier feature of *millimetres*; metric distance bias in attention; the
+   SSM's discretisation step scaled by the real inter-slice gap; resampling to
+   physical spacing rather than to a pixel grid.
+3. **Twelve pathologies, twelve queries.** Each target pools its own slice and
+   sequence evidence, refined by a top-2 MoE routed from the anatomical
+   mechanism taxonomy and regularised on the Poincaré ball.
+4. **The report is privileged information, never a test-time shortcut.**
+   Soft-target contrastive pretraining, unbalanced optimal-transport
+   phrase→slice grounding without boxes, four-state multilingual weak labels,
+   cross-fitted distillation — and a shortcut regulariser plus a *blocking*
+   audit that refuses a multimodal teacher which is secretly a text classifier.
+5. **Optimise the metric, after the classifier exists.** AUC min-max margin
+   (verified against the pairwise surrogate at the saddle point), two-way
+   partial AUC via implicit-differentiated soft top-k, and a momentum memory
+   queue for the labels where a minibatch contains no positive.
+6. **Compute follows pathology.** Coarse pass at 0.70 mm → per-(study, label)
+   confidence-and-uncertainty gate → Gumbel top-k slice selection → fine pass at
+   0.35 mm. Thresholds read off a measured runtime–AUC Pareto frontier, with a
+   closed-loop governor that guarantees the notebook finishes.
+
+---
+
+## Install
+
+```bash
+pip install -e ".[train,dev]"     # torch, timm, pydicom, pyarrow, pytest
+pip install -e .                  # numpy/pandas only: folds, metrics, ensembling, submission
+```
+
+The numpy-only surface imports without torch, so fold construction, evaluation,
+ensembling, calibration and submission validation run in a lightweight job. The
+torch surface is lazily imported.
+
+## Verify
+
+```bash
+pytest -q                          # 131 tests
+python scripts/99_smoke_test.py    # 10-stage end-to-end run, ~20 s, CPU only
+```
+
+The smoke test drives the real code path — folds → collation → model
+forward/backward under the curriculum → OOF evaluation → audit suite →
+ensembling → calibration → conformal → submission — on synthetic data. No
+stubs.
+
+## Use
+
+```bash
+python scripts/01_make_folds.py --manifest artifacts/manifest.parquet \
+    --out artifacts/folds --n-folds 5 --anneal-steps 60000
+
+python scripts/05_oof_eval.py --oof artifacts/oof/convnext_s.npz \
+    --folds artifacts/folds/folds.parquet --report artifacts/reports/convnext_s.txt
+
+python scripts/06_ensemble.py --oof artifacts/oof/*.npz \
+    --folds artifacts/folds/folds.parquet --out artifacts/ensemble
+```
+
+`notebooks/kaggle_inference.py` is the offline submission notebook: it writes a
+valid fallback `submission.csv` *before* inference starts, discovers weights by
+globbing attached datasets, governs its own runtime, shards predictions to disk,
+and validates the file it wrote.
+
+---
+
+## Layout
+
+```
+src/kairos/
+  constants.py            12 targets, mechanism tree, compartments, 15 sequence families
+  io/geometry.py          slice ordering, canonical direction/laterality, QC, affines
+  data/
+    folds.py              patient-safe multi-objective CV (iterative strat + annealing)
+    dataset.py            DICOM → metric-resampled, robust-normalised 2.5D tensors
+    sequence_taxonomy.py  (plane, weighting, fat-sat) from physics, not description
+  text/ontology.py        multilingual knee lexicon, post-posed negation, compartments
+  models/
+    encoding.py           physical Fourier / rotary-in-mm / acquisition FiLM
+    aggregator.py         metric-distance slice transformer; irregular-Δ selective SSM
+    label_queries.py      12 label queries, cross-sequence fusion, top-2 MoE
+    heads.py              SNGP (RFF + Laplace) with a soft spectral-norm trunk
+    adaptive.py           Gumbel top-k, confidence gate, PonderNet halting
+    hyperbolic.py         Poincaré ontology, entailment cones
+    backbones.py          timm/DINOv3/MedSigLIP adapters, stem inflation, LoRA
+    system.py             the assembled coarse-to-fine model
+  losses/
+    auc.py                AUC min-max margin, two-way pAUC, memory-queue ranking
+    ot.py                 log-domain balanced/unbalanced Sinkhorn, phrase→slice OT
+    supervised.py         ASL, pattern-rarity BCE, Gaussian copula (composite NLL)
+    multimodal.py         soft-target contrastive, decoupled KD, shortcut regulariser
+    robust.py             Group-DRO (+SE shrinkage), CVaR, χ²-DRO, IRMv1
+  optim/pesg.py           PESG min-max, ASAM, PCGrad/CAGrad/Aligned-MTL
+  train/                  five-stage curriculum, declarative loss schedule, trainer
+  eval/
+    metrics.py            DeLong (co)variance + paired test, patient-cluster bootstrap
+    leakage.py            ten-audit shortcut suite, five of them blocking
+  ensemble/weights.py     anchored mirror descent + James–Stein shrinkage + nested LOFO
+  calibrate/conformal.py  Newton temperature, beta, conformal risk control, Mondrian
+  infer/                  runtime–AUC Pareto, closed-loop governor, submission writer
+```
+
+---
+
+## Design decisions worth knowing about
+
+**The fold artefact is immutable.** `fold_hash` is stored in every checkpoint
+manifest and `Trainer.load` refuses a mismatch. Silently ensembling across split
+versions produces an OOF score that is optimistic by an amount nobody can later
+reconstruct.
+
+**The audit suite blocks.** Five audits exit the pipeline non-zero:
+`shuffled_label`, `shuffled_report`, `duplicate_hash`, `embedding_neighbour`,
+and the fold-hash check. An audit that only warns is an audit that gets ignored.
+
+**Per-label ensemble weights must earn their place.** `06_ensemble.py` reports
+the nested leave-one-fold-out comparison and ships the *uniform* average unless
+the nested gain exceeds one bootstrap standard error. Overriding requires
+`--force-weighted`.
+
+**Calibration cannot move the leaderboard.** Only monotone calibrators
+(temperature, beta) are on by default; isotonic is provided but off, because it
+ties scores and does change AUC.
+
+**A submission that raises scores nothing.** The notebook writes a valid
+fallback first and degrades to coarse-only under budget pressure rather than
+overrunning.
+
+---
+
+## Tests
+
+131 tests, pinning numerics rather than shapes. A selection of what they check:
+
+- AUC-M equals `p(1-p)·E[(m − h(x⁺) + h(x⁻))²]` at the saddle point
+- DeLong's SE agrees with a 1500-replicate bootstrap to within 20 %
+- Sinkhorn recovers a known permutation; unbalanced OT destroys mass when
+  nothing matches; masks are respected exactly
+- `Φ₂(0,0;ρ) = ¼ + arcsin(ρ)/2π` to 1e-6, and `Φ₂(h,k;0) = Φ(h)Φ(k)` to 1e-12
+- Beta calibration and temperature scaling leave AUC unchanged to 1e-9
+- Conformal risk control achieves nominal coverage on held-out data
+- Soft top-k sums to *k* and is differentiable through the implicit `ν`
+- Spectral normalisation bounds the empirical Lipschitz ratio at ≤ 1.05
+- SNGP variance is larger far from the training distribution
+- Aligned-MTL is invariant to a 100× rescale of one task's loss
+- Folds never split a patient; the rarest label's per-fold prevalence stays
+  within 40 % relative
+- Resampling gives the same physical field of view from 0.25 mm and 1.0 mm input
+- Robust normalisation is invariant to affine intensity rescaling and survives
+  a metal artefact
+- Every audit fires on a deliberately planted defect and stays quiet otherwise
+
+Four real bugs were found by these tests during development and are documented
+in the code at the site of each fix: a canonical-flip sign error that left the
+physical coordinate decreasing; the class-conditional-vs-batch-mean error in
+AUC-M (a factor of ~6); `np.nan_to_num` mapping `+inf` to 1.8e308 so Otsu's
+argmax always chose the last bin; and `\b` not splitting on `_`, which made
+`sag_pdw_fs_tse` classify as non-fat-suppressed.
+
+---
+
+## Licence and attribution
+
+Model weights carry their upstream licences; every candidate checkpoint's
+licence, redistribution rights and compatibility with the winners'
+weight-publication obligation are verified before it enters an ensemble.
+
+A competition AUC does not establish a safe clinical operating point. See
+[`docs/DESIGN.md`](docs/DESIGN.md) §10 for what deployment would actually
+require.
