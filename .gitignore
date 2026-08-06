@@ -4,3 +4,10 @@ dist/
 *.log
 .env
 .env.local
+
+# Python virtualenvs and caches (the rsna-knee test stack lives here)
+.venv*/
+venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
