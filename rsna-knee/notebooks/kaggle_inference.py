@@ -101,11 +101,15 @@ N_STUDIES = len(STUDY_UIDS)
 log(f"test set: {N_STUDIES} studies")
 
 # The safety net: a valid file exists from this point on, no matter what.
+# ``allow_constant`` is required here -- the fallback is 0.5 everywhere by
+# design, and the constant-column check that protects the *final* submission
+# would otherwise raise and leave no file at all.
 build_submission(
     STUDY_UIDS,
     np.full((N_STUDIES, NUM_TARGETS), 0.5),
     output_path="submission.csv",
     sample_submission=sample,
+    allow_constant=True,
 )
 log("fallback submission.csv written")
 

@@ -439,6 +439,32 @@ def test_submission_roundtrip_and_validation(tmp_path):
     df.to_csv(out, index=False)
     with pytest.raises(SubmissionError, match="constant"):
         validate_submission(out)
+    # ... but the check is opt-out, because the inference notebook's safety net
+    # writes a deliberately-constant 0.5 fallback before inference starts.
+    info = validate_submission(out, require_varying=False)
+    assert info["constant_columns"] == ["ACL"]
+
+
+def test_constant_fallback_submission_is_writable(tmp_path):
+    """Regression: the notebook's Stage-0 safety net used to raise.
+
+    ``build_submission`` validated its own output with the constant-column
+    check enabled, so writing the all-0.5 fallback -- the exact thing that
+    guarantees a file exists no matter what happens later -- crashed.
+    """
+    pytest.importorskip("pandas")
+    from kairos.infer.submission import SubmissionError, build_submission
+
+    uids = [f"u{i}" for i in range(12)]
+    flat = np.full((12, len(TARGETS)), 0.5)
+    out = tmp_path / "submission.csv"
+
+    with pytest.raises(SubmissionError, match="constant"):
+        build_submission(uids, flat, output_path=out)
+
+    df = build_submission(uids, flat, output_path=out, allow_constant=True)
+    assert len(df) == 12
+    assert out.exists()
 
 
 def test_submission_fills_from_sample_and_averages_duplicates(tmp_path):

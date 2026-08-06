@@ -40,6 +40,7 @@ def build_submission(
     sample_submission: "object | None" = None,
     fill_missing: float = 0.5,
     strict: bool = True,
+    allow_constant: bool = False,
 ):
     """Write ``submission.csv`` and validate it by reading it back.
 
@@ -52,6 +53,16 @@ def build_submission(
         with ``fill_missing``.  This is the single most valuable safety net in
         the whole pipeline: a study that crashes DICOM decoding then costs a
         0.5 prediction instead of an invalid file.
+    allow_constant
+        Permit columns with zero variance.  Off by default, because a constant
+        column in a *real* submission means a head never fired or a checkpoint
+        failed to load, and it scores exactly 0.5 on that label.
+
+        It must be ``True`` for the deliberately-constant fallback the
+        inference notebook writes before inference starts -- otherwise the
+        safety net raises and there is no file at all, which is the exact
+        failure the safety net exists to prevent.  (This is not hypothetical:
+        the notebook shipped with that bug until a test caught it.)
     """
     import pandas as pd
 
@@ -99,11 +110,20 @@ def build_submission(
     path = Path(output_path)
     df.to_csv(path, index=False)
 
-    validate_submission(path, expected_uids=None if sample_submission is None else want)
+    validate_submission(
+        path,
+        expected_uids=None if sample_submission is None else want,
+        require_varying=not allow_constant,
+    )
     return df
 
 
-def validate_submission(path: str | Path, *, expected_uids: list[str] | None = None) -> dict:
+def validate_submission(
+    path: str | Path,
+    *,
+    expected_uids: list[str] | None = None,
+    require_varying: bool = True,
+) -> dict:
     """Re-read a submission file and assert every format invariant."""
     import pandas as pd
 
@@ -147,7 +167,7 @@ def validate_submission(path: str | Path, *, expected_uids: list[str] | None = N
     # A constant column scores exactly 0.5 AUC and is almost always a bug --
     # a head that never fired, or a fold whose weights failed to load.
     constant = [t for t in TARGETS if float(np.ptp(df[t].to_numpy())) < 1e-9]
-    if constant:
+    if constant and require_varying:
         raise SubmissionError(f"constant prediction column(s): {constant}")
 
     return {
@@ -155,5 +175,6 @@ def validate_submission(path: str | Path, *, expected_uids: list[str] | None = N
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "min": float(vals.min()),
         "max": float(vals.max()),
+        "constant_columns": constant,
         "mean_per_label": {t: float(df[t].mean()) for t in TARGETS},
     }
