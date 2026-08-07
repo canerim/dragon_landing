@@ -58,6 +58,7 @@ __all__ = [
     "fit_label_weights",
     "nested_evaluate",
     "rank_transform",
+    "combine_members",
     "greedy_selection",
     "bayesian_model_average",
 ]
@@ -66,21 +67,95 @@ _EPS = 1e-12
 
 
 def rank_transform(scores: np.ndarray) -> np.ndarray:
-    """Map each column to :math:`(\\mathrm{rank}-1)/(N-1) \\in [0,1]`.
+    """Map each column to :math:`(\\mathrm{rank}-1)/(N-1) \\in [0,1]`, midranks.
 
     Applied per model per label before averaging.  AUC is invariant to this
     transform for a *single* model but not for a *mixture*, and the mixture of
     ranks is robust to one model's logits living on a different scale -- which
     happens automatically when one member is trained with AUC-margin and
     another with ASL.
+
+    Ties get the *average* of the ranks they span, which is the same
+    convention :func:`kairos.eval.metrics.roc_auc` uses.  Ordinal ranks would
+    break ties in argsort order -- an arbitrary permutation that is not even a
+    monotone function of the input, so a single model's AUC would change under
+    a transform that is supposed to leave it alone.  With a failed-study
+    fallback that writes 0.5 to every label, exact ties are common enough for
+    this to matter.
     """
     s = np.asarray(scores, dtype=np.float64)
-    order = np.argsort(s, axis=0, kind="mergesort")
-    ranks = np.empty_like(s)
-    n = s.shape[0]
-    idx = np.arange(n, dtype=np.float64)[:, None]
-    np.put_along_axis(ranks, order, np.broadcast_to(idx, s.shape), axis=0)
-    return ranks / max(n - 1, 1)
+    flat = s.reshape(s.shape[0], -1) if s.ndim > 1 else s[:, None]
+    n = flat.shape[0]
+    out = np.empty_like(flat)
+    for c in range(flat.shape[1]):
+        col = flat[:, c]
+        srt = np.sort(col)
+        # Midrank = (#strictly-less + #less-or-equal - 1) / 2.  For a unique
+        # value both searches bracket a single position and this is the plain
+        # rank; for a run of k equal values it is the mean of the k positions
+        # they occupy, which is the definition of a midrank.
+        lo = np.searchsorted(srt, col, side="left")
+        hi = np.searchsorted(srt, col, side="right")
+        out[:, c] = 0.5 * (lo + hi - 1)
+    out /= max(n - 1, 1)
+    return out.reshape(s.shape) if s.ndim > 1 else out[:, 0]
+
+
+def combine_members(
+    member_preds: np.ndarray,
+    weights: np.ndarray | None = None,
+    *,
+    rescale: bool = True,
+) -> np.ndarray:
+    r"""Combine ``(M, N, L)`` member predictions into ``(N, L)``.
+
+    This is the *deployment* counterpart of :func:`fit_label_weights`, and it
+    has to match it exactly: the weights are a per-label simplex fitted on
+    **rank-transformed** OOF predictions, so combining raw probabilities at
+    test time optimises one objective and ships another.  Rank averaging is
+    also simply the right combiner for a rank metric -- it is invariant to how
+    differently the members happen to be calibrated, which they are, because
+    a member trained with AUC-margin and one trained with ASL do not put their
+    probability mass in the same place.
+
+    ``rescale`` maps the combined ranks back onto the members' own probability
+    scale through a *strictly increasing* per-label map, so the returned array
+    still looks like probabilities (prevalence sanity checks, calibration
+    reporting) while having exactly the AUC of the rank combination.  The
+    strictness matters: ``ref[idx]`` alone is only non-decreasing, and with a
+    fallback that writes 0.5 to every label of a failed study, duplicated
+    reference values would collapse distinct ranks into ties and cost real AUC.
+    (Two combined ranks that differ only at the float-noise level do end up
+    tied, which is the correct reading of them anyway.)
+    """
+    p = np.asarray(member_preds, dtype=np.float64)
+    if p.ndim != 3:
+        raise ValueError(f"expected (M, N, L), got {p.shape}")
+    M, N, L = p.shape
+    p = np.nan_to_num(p, nan=0.5, posinf=1.0, neginf=0.0)
+
+    if weights is None:
+        weights = np.full((L, M), 1.0 / M)
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.shape != (L, M):
+        raise ValueError(f"weights must be (L, M) = {(L, M)}, got {weights.shape}")
+    weights = weights / weights.sum(axis=1, keepdims=True).clip(_EPS)
+
+    if N < 2:  # a rank is not defined for a single study
+        return np.einsum("lm,mnl->nl", weights, p)
+
+    ranked = np.stack([rank_transform(p[m]) for m in range(M)])
+    combined = np.einsum("lm,mnl->nl", weights, ranked)
+    if not rescale:
+        return combined
+
+    mean_prob = p.mean(axis=0)
+    out = np.empty_like(combined)
+    for l in range(L):
+        ref = np.sort(mean_prob[:, l])
+        idx = np.clip(np.round(combined[:, l] * (N - 1)).astype(int), 0, N - 1)
+        out[:, l] = ref[idx] * (1.0 - 1e-6) + 1e-6 * combined[:, l]
+    return out
 
 
 def _smooth_auc(y: np.ndarray, s: np.ndarray, *, tau: float = 0.05

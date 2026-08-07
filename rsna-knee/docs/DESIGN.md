@@ -38,9 +38,17 @@ falsifiable on out-of-fold data:
 4. **The report is privileged information, never a test-time shortcut.** It
    enters through soft-target contrastive pretraining, optimal-transport
    phrase→slice grounding, four-state weak labels and cross-fitted
-   distillation. A shortcut regulariser measures — and penalises — the model's
-   reliance on the report, and a blocking audit refuses to ship a multimodal
-   teacher that is secretly a text classifier.
+   distillation — all of which shape the *representation*. No branch of the
+   deployed model is conditioned on text. That is a deliberate scoping
+   decision, not an omission: the test set carries no reports, so a
+   report-conditioned branch can only pay off through the representation
+   (already covered) or as a KD teacher — and a teacher that reads the finding
+   out of the report emits logits the image-only student cannot reproduce, so
+   distilling them degenerates to label smoothing. `ReportShortcutRegulariser`
+   and the blocking `shuffled_report` audit remain available for a variant that
+   does build such a branch; they are not scheduled, and the objective
+   validator now checks *output* preconditions so that a term the model cannot
+   feed is a startup error rather than a silent no-op.
 
 5. **The metric should be optimised directly, but only after the classifier
    exists.** We use the min-max margin formulation of the AUC surrogate, whose
@@ -199,7 +207,26 @@ a **learned bias initialised from the prior**, never a hard gate: atypical
 protocols exist, and hard gating silently destroys recall at exactly the sites
 that use them.
 
-### 2.4 Cross-validation as constrained optimisation
+### 2.4 Studies that do not survive decoding
+
+`00_build_manifest.py` decides usability from DICOM *headers*
+(`stop_before_pixels=True`, which is what makes scanning a 16-site archive
+affordable), while `load_study` additionally rejects on a pixel-decode failure.
+A missing codec plugin or a truncated `PixelData` therefore passes QC and only
+fails at train time, producing a `StudyRecord` with no series at all.
+
+Such a record must not be treated as data. Its `series_mask` row is all-False,
+so cross-sequence fusion masks every logit to $-\infty$, softmax returns a
+uniform distribution over *padded* slots, and the head emits a finite logit
+computed entirely from zeros. Scored against the study's real targets that is
+pure padding gradient in training and a fabricated row in the OOF matrix.
+`collate_studies` therefore emits a `study_valid` mask, NaNs the targets of
+invalid studies — so every masked loss skips them by the same mechanism that
+already handles unobserved labels — and `Trainer.predict` drops them from the
+OOF with a logged count, because a systematic decode failure must look like a
+systematic decode failure and not like a bad epoch.
+
+### 2.5 Cross-validation as constrained optimisation
 
 Plain stratified $k$-fold is inadequate on three counts simultaneously: it
 cannot respect patient grouping, it handles multi-label marginals poorly, and it
@@ -405,11 +432,28 @@ The inner maximisation is concave with closed-form optimum
 $\alpha^\star = m + \mathbb E[h\mid y{=}0] - \mathbb E[h\mid y{=}1]$; we keep
 $\alpha$ as a parameter under gradient *ascent* rather than substituting the
 closed form, because the closed form is optimal only for population moments and
-is badly noisy on a minibatch. `PESG` performs descent on $(\theta,a,b)$,
-ascent on $\alpha$, adds a proximal anchor $\tfrac{\gamma}{2}\|\theta -
-\theta_{\text{ref}}\|^2$ reset each epoch, and projects $a,b\in[0,1]$,
-$\alpha\ge 0$. Without the anchor the ascent and descent chase each other with
-a period of a few hundred steps.
+is badly noisy on a minibatch.
+
+**Who optimises what.** `PESG` owns the saddle-point block $(a,b,\alpha)$ and
+nothing else: descent on $(a,b)$ with a proximal anchor
+$\tfrac{\gamma}{2}\|\cdot-\cdot_{\text{ref}}\|^2$ reset each epoch, ascent on
+$\alpha$, and projection onto $a,b\in[0,1]$, $\alpha\ge 0$. Without the anchor
+the ascent and descent chase each other with a period of a few hundred steps.
+$\theta$ stays with AdamW for the whole run, because $\theta$ appears only in
+the minimisation — there is nothing about it that needs a min-max optimiser.
+
+Splitting by *role* rather than by *stage* is deliberate, and it repairs three
+failures of the obvious alternative (swap the whole optimiser for PESG during
+the ranking stage), each of which is silent. First, PESG then ran at a fixed
+step size, so the cosine decay and the stage's `lr_scale=0.3` were ignored for
+the entire stage. Second, it was rebuilt at the next stage boundary, discarding
+both its momentum and its proximal reference. Third, and worst, `auc_margin` is
+scheduled in S4 as well as S3, but the stage test keyed on the string
+`"ranking"` — so from the S3/S4 boundary onward $\alpha$ accumulated a gradient
+that nothing applied. A frozen $\alpha$ turns $A_3$ into a fixed linear penalty
+and the objective quietly stops being the min-max surrogate. PESG now steps
+exactly on the steps where the term has non-zero weight, and rides the same
+learning-rate schedule as everything else.
 
 **Two-way partial AUC.** Nobody triages a knee MRI worklist at 70 % FPR. We add
 a low-weight term restricted to $\mathrm{FPR}\le\beta$, $\mathrm{TPR}\ge\alpha$,
@@ -509,10 +553,26 @@ the plan's per-label marginal to the model's own slice attention. The whole term
 is gated on extraction confidence: ungated, it will happily ground a *negated*
 finding onto a slice, which is worse than no supervision.
 
-**Shortcut regularisation.** The failure mode that would otherwise sink this
-whole direction is a "multimodal teacher" that converges to a report-only
-classifier — invisible in its own validation AUC, useless as a teacher for an
-image-only student. We penalise
+**No report-conditioned prediction branch — and why.** The obvious next step
+is a model that reads the report at training time and is distilled into an
+image-only student. We do not build one, and the reason is worth stating
+because the omission would otherwise look like an oversight.
+
+A report-conditioned branch has exactly two paths to score. The first is the
+*representation*: aligning the image encoder to report semantics. That path is
+already taken, by the soft-target contrastive term and the OT grounding above —
+both of which shape the encoder without ever putting text in the inference
+graph. The second is as a *KD teacher*. That path does not work here: the
+report states the finding, so a report-conditioned teacher's logits are close
+to a noisy copy of the labels, and distilling them into an image-only student
+reduces to label smoothing on the same targets the supervised term already
+uses. There is no dark knowledge for the student to recover, because the
+teacher's advantage is information the student can never observe. The teacher
+we actually distil from in S4 is the cross-fitted OOF ensemble of image-only
+models, whose logits *are* reproducible from pixels.
+
+The guard rail for anyone who does build such a branch is implemented and
+tested: `ReportShortcutRegulariser` penalises
 
 $$
 \mathbb E\big[\mathrm{ReLU}(\mathcal C(z^{\text{shuf}})-\mathcal C(z^{\text{true}})+\delta)\big]
@@ -521,8 +581,12 @@ $$
 
 $\mathcal C$ = negative predictive entropy: a shuffled report must not make the
 model *more* certain, and under a shuffled report the prediction must fall back
-to the image-only one. The scalar `report_reliance` is logged every epoch — it is
-the single number that says whether the multimodal teacher is real.
+to the image-only one. `shuffled_report_audit` is the blocking evaluation-time
+counterpart. Neither is in the shipped curriculum. The objective registry
+declares the model outputs each term reads, and `validate_schedule` refuses to
+start a run that schedules a term the model cannot feed — which is how this
+particular gap was found: the term had been scheduled at weight 0.5 for the
+whole of S1 and had been returning `None` every step.
 
 ### 4.4 Multilingual report parsing
 
@@ -575,9 +639,18 @@ whose induced weights are *linear* in the excess loss rather than 0/1. That
 single difference is why it tolerates label noise where CVaR does not — a
 mislabelled study gets a large but finite weight instead of the entire budget.
 
-**IRMv1** applied *only* to the text-conditioned branch, to discourage learning
-site-specific report-template features. Applied to the image branch it mostly
-hurts; the ablation records that.
+**IRMv1** over *acquisition* environments — the (site, scanner, field-strength)
+buckets stamped into `StudyRecord.env_index` — asking that the optimal rescaling
+of the logits be the same at every centre. A feature needing a different gain at
+one site is a feature about that site. Scoped honestly: it is applied to the
+image classifier, scheduled in S4 only, and we have no ablation of our own
+isolating its contribution; the justification is Arjovsky et al.'s plus the fact
+that the test-set site distribution differs from training. `04_train.py` resolves
+the environment column from `site` → `scanner_proxy` → `manufacturer` →
+`field_strength_bucket` and **disables both `group_dro` and `irm`, recording the
+fact in the run manifest, when only one environment is resolvable** — a
+single-group DRO is the mean and a single-environment IRM is identically zero,
+so running them would cost compute, log a plausible number and change nothing.
 
 Schedule: ERM for the first third (you cannot robustify a model that has not
 learnt the task), then a linear ramp to `0.3·GroupDRO + 0.1·χ²-DRO`.
@@ -594,6 +667,37 @@ arbitrary relative scaling of the twelve losses — and our losses have wildly
 different natural scales. Surgery is applied only to the fusion + router + head
 block: memory is $L\times P$ floats, and early-backbone gradient conflict is
 empirically negligible.
+
+Three implementation details decide whether this helps or silently stops
+training.
+
+*The spectrum must be truncated, not clamped.* `Medial OA` and `Lateral OA`
+produce near-collinear gradients constantly, so $GG^\top$ is rank deficient and
+its smallest singular value is numerically zero. The $\sigma_{\min}$ prefactor
+would then scale the **entire** update to zero: the loss plateaus and nothing in
+the logs says why. We discard directions below $10^{-6}\sigma_{\max}$ and take
+$\sigma_{\min}$ over the retained spectrum — the pseudo-inverse on the row
+space, which loses nothing because discarded directions contribute to no $g_l$.
+An all-zero $G$ falls back to the plain sum, not to $0$. Tasks whose gradient is
+numerically zero on a batch (a rare label with no positive) are dropped before
+combination and surgery is skipped below two active tasks.
+
+*It has to compose, not overwrite.* The twelve per-label terms are one part of a
+larger objective. `prepare`/`apply_` add
+$\Delta=\mathcal S(G)-\sum_l g_l$ to `.grad`, leaving
+$g_{\text{other}}+\mathcal S(G)$ — exact whatever else is in the loss. The
+per-label decomposition must sum to the term it replaces *exactly*, which is why
+`AsymmetricLoss`/`AUCMarginLoss` expose a `label_contrib` reduction (dividing by
+the total valid count, not the per-label count) and why `compute_losses`
+evaluates only the decomposition and takes its sum as the scalar — calling the
+term twice would decay `AUCMarginLoss`'s prevalence EMA twice per step.
+
+*Order matters for memory.* $G$ is measured **before** the main `backward`,
+while the graph is alive but `.grad` is still empty, and applied after. Since
+the inputs are restricted to the fusion/head block, autograd traverses only the
+tail. Running `loss.backward(retain_graph=True)` first instead would pin the
+entire backbone activation stack for the duration. Measured cost of surgery in
+the shipped configuration: none detectable (20.15 s/step off, 19.77 s/step on).
 
 ---
 
@@ -699,11 +803,27 @@ medical-imaging competitions. Three mechanisms:
    nested weighted macro does not beat the nested uniform macro by more than one
    bootstrap SE, ship the uniform average.**
 
-Also provided: rank averaging (scale-free, correct default when members differ
-in calibration — but useless for distillation, so the teacher always uses
-probability averaging), Caruana greedy selection with replacement, and a
-Bayesian bootstrap that propagates "which model is better for `Fracture`"
-uncertainty into the weights.
+**Fit and deployment must combine in the same space.** The weights above are a
+per-label simplex fitted on **rank-transformed** OOF predictions, so
+`combine_members` — the single function both `06_ensemble.py` and the
+submission notebook call — rank-transforms each member before applying them.
+Combining raw probabilities at test time, which the notebook used to do, would
+optimise one objective and ship another; and since macro-AUC sees only the
+ordering, rank averaging is the right combiner anyway, being invariant to the
+fact that a member trained with AUC-margin and one trained with ASL do not put
+their probability mass in the same place. The ranks are midranks, matching the
+convention `roc_auc` already uses: ordinal ranks break ties in argsort order,
+which is not a monotone function of the input, so a *single* model's AUC would
+move under a transform meant to leave it alone — worth ~2 · 10⁻⁴ on a column
+with the tie structure a failed-study fallback produces. The combined ranks are
+finally mapped back onto the members' probability scale through a strictly
+increasing per-label map, so the file still carries interpretable probabilities
+at exactly the AUC of the ranking.
+
+Also provided: Caruana greedy selection with replacement, and a Bayesian
+bootstrap that propagates "which model is better for `Fracture`" uncertainty
+into the weights. Rank averaging is useless for distillation (ranks are not
+probabilities), so the KD teacher always uses probability averaging.
 
 ### 6.4 Calibration and conformal risk control
 
@@ -755,6 +875,34 @@ ranking, and adding AUC-M on top makes it trade teacher agreement for its own
 noisy ranking estimate — measurably worse on every label with < 150 positives.
 
 ---
+
+### Test-time augmentation is off by default
+
+The notebook has a correct TTA path and does not use it. Two reasons, both
+learned the hard way.
+
+The view used to be built with `batch.__class__(**batch.__dict__)`, and
+`StudyBatch` is `@dataclass(slots=True)` — it has no `__dict__`. That raised on
+the first study and was swallowed by the surrounding `except Exception: pass`,
+so TTA had been a silent no-op: it looked enabled, cost nothing, and gained
+nothing. It is now built with `dataclasses.replace`, and a failure is counted
+and logged once rather than swallowed.
+
+The view itself was a left-right mirror, averaged into the original logits
+**without permuting the labels** — the exact corruption `MEDIAL_LATERAL_SWAP`
+exists to prevent during training, applied at submission time to `Medial
+Meniscus`, `Lateral Meniscus`, `Medial OA` and `Lateral OA`. And even permuted
+it is out of distribution: laterality is canonicalised in the loader and
+`horizontal_flip_prob` is 0, so the network has never seen a mirrored knee. The
+mirror is now correctly permuted and gated behind `KAIROS_TTA_FLIP`, for weights
+actually trained with flips.
+
+What remains is a gamma view, inside the training distribution and
+label-preserving. It is still off by default (`MAX_TTA=1`), because a second
+forward pass doubles inference cost and the governor pays for that by
+throttling the fine pass — trading a designed, measurable coarse-to-fine gain
+for an unmeasured augmentation-averaging one. Raise `KAIROS_MAX_TTA` when an
+OOF number says the trade is worth it.
 
 ## 8. The final ensemble
 
@@ -858,10 +1006,13 @@ descending order of expected effect:
    metric rotary attention, metric ALiBi, physical Δ in the SSM, metric
    resampling) instead of index-based encodings that memorise site protocols.
 3. **Twelve label queries + MoE + ontology prior** instead of one pooled vector
-   and twelve linear heads.
-4. **Report as privileged information with an enforced anti-shortcut
-   constraint**, including OT grounding without boxes, instead of either
-   ignoring reports or letting them leak.
+   and twelve linear heads, with Aligned-MTL surgery on the shared fusion/head
+   block so the twelve gradients are whitened by their own spectrum rather than
+   summed — the update no longer depends on the arbitrary relative scale of the
+   twelve losses.
+4. **Report as privileged information, confined to the representation**,
+   including OT grounding without boxes, instead of either ignoring reports or
+   letting them leak into a prediction path that cannot exist at test time.
 5. **Distributional robustness with the corrections that make it work at this
    scale** (SE shrinkage, per-label standardisation) instead of vanilla
    Group-DRO, which at 16 sites of unequal size chases the smallest one.

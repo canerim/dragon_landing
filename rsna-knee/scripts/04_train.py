@@ -42,7 +42,7 @@ import torch
 from kairos.constants import NUM_TARGETS, TARGETS
 from kairos.data.loader import SamplerConfig, StudyDataset, build_dataloader, infer_prevalence
 from kairos.data.transforms import AugmentConfig
-from kairos.eval.metrics import macro_auc, per_label_auc
+from kairos.eval.metrics import per_label_auc
 from kairos.models.backbones import BackboneSpec
 from kairos.models.system import KairosConfig, KairosModel
 from kairos.train.curriculum import default_plan, student_plan
@@ -74,6 +74,37 @@ def package_versions() -> dict:
 # --------------------------------------------------------------------------- #
 # Synthetic data path (for --synthetic)                                        #
 # --------------------------------------------------------------------------- #
+
+
+#: Columns that can stand in for "acquisition environment", best first.
+#: ``site`` is not a DICOM tag and the organisers do not ship one, so the
+#: honest proxy is the scanner: ``scripts/00_build_manifest.py`` writes
+#: ``scanner_proxy`` = manufacturer/field-strength for exactly this purpose.
+#: Looking only for ``site`` -- which is what this script used to do -- meant
+#: every study landed in environment 0, and Group-DRO with one group is the
+#: mean, while IRM with one environment is identically zero.  Both terms then
+#: cost their compute, logged a plausible number, and changed nothing.
+ENV_COLUMNS = ("site", "scanner_proxy", "manufacturer", "field_strength_bucket")
+
+
+def _resolve_environments(df, n: int):
+    """Return ``(env_index_per_study, column_used)``."""
+    import pandas as pd
+
+    for col in ENV_COLUMNS:
+        if col not in df.columns:
+            continue
+        codes = pd.factorize(df[col].astype(str))[0]
+        if codes.max() >= 1:  # at least two distinct environments
+            print(f"environments: {codes.max() + 1} distinct values of '{col}'")
+            return codes.astype(int), col
+    print(
+        "!! no usable environment column (looked for "
+        + ", ".join(ENV_COLUMNS)
+        + "); group_dro and irm will be disabled",
+        file=sys.stderr,
+    )
+    return np.zeros(n, dtype=int), None
 
 
 def synthetic_cohort(n_studies: int, size: int, seed: int):
@@ -145,7 +176,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20261022)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--asam", action="store_true")
-    ap.add_argument("--gradient-surgery", default="none",
+    ap.add_argument("--gradient-surgery", default="aligned",
                     choices=("none", "aligned", "pcgrad", "cagrad"))
 
     ap.add_argument("--disable", default="",
@@ -168,7 +199,10 @@ def main() -> int:
         uids, labels, groups, load_fn = synthetic_cohort(args.synthetic_n, size, args.seed)
         fold_of = np.array([i % 5 for i in range(len(uids))])
         fold_hash = "synthetic-" + "0" * 8
-        sites = np.zeros(len(uids), dtype=int)
+        # Two environments, so group_dro / irm are exercised rather than
+        # silently degenerate in the smoke path.
+        sites = np.arange(len(uids)) % 2
+        site_col = "synthetic"
     else:
         if args.folds is None:
             ap.error("--folds is required unless --synthetic is given")
@@ -190,9 +224,7 @@ def main() -> int:
         gcol = next((c for c in ("PatientID", "patient_id", "group_id") if c in df), None)
         groups = df[gcol].astype(str).tolist() if gcol else uids
         fold_of = df["fold"].to_numpy()
-        sites = (
-            pd.factorize(df["site"])[0] if "site" in df else np.zeros(len(uids), int)
-        )
+        sites, site_col = _resolve_environments(df, len(uids))
 
         from kairos.data.dataset import load_study
         from kairos.io.layout import discover
@@ -215,8 +247,17 @@ def main() -> int:
         def load_fn(uid: str):
             return load_study(images / uid, out_size=args.image_size)
 
+    available = sorted(int(f) for f in np.unique(fold_of))
+    if args.fold not in available:
+        ap.error(
+            f"--fold {args.fold} is not present in the split (folds: {available}). "
+            "Training would otherwise use 100% of the data and report an empty "
+            "validation set as success."
+        )
     train_idx = np.flatnonzero(fold_of != args.fold)
     val_idx = np.flatnonzero(fold_of == args.fold)
+    if val_idx.size == 0 or train_idx.size == 0:
+        ap.error(f"fold {args.fold} leaves {train_idx.size} train / {val_idx.size} val")
     print(f"fold {args.fold}: {len(train_idx)} train / {len(val_idx)} val studies")
     print(f"fold hash: {fold_hash}")
 
@@ -257,10 +298,17 @@ def main() -> int:
     n_par = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"model: {args.backbone}, {n_par / 1e6:.1f}M trainable parameters")
 
-    steps_per_epoch = max(1, len(train_idx) // max(args.batch_size, 1))
+    # Optimiser steps, not batches.  Trainer.step increments once per
+    # *optimiser* step, so counting batches makes the curriculum advance
+    # accum_steps times too slowly: with accum=4 a plan that nominally covers
+    # 30 epochs only ever reaches a quarter of the way through its stages, and
+    # the ranking and robustness stages never run at all.
+    batches_per_epoch = max(1, len(train_idx) // max(args.batch_size, 1))
+    steps_per_epoch = max(1, batches_per_epoch // max(args.accum, 1))
     plan = (student_plan(steps_per_epoch=steps_per_epoch) if args.student
             else default_plan(steps_per_epoch=steps_per_epoch, budget=args.budget))
-    print(f"curriculum: {plan.total_epochs} epochs, {plan.total_steps} steps")
+    print(f"curriculum: {plan.total_epochs} epochs, {plan.total_steps} optimiser "
+          f"steps ({batches_per_epoch} batches/epoch, accum {args.accum})")
 
     objectives = build_objectives(
         ObjectiveConfig(prevalence=prevalence.tolist(),
@@ -272,6 +320,11 @@ def main() -> int:
     # -- schedule validation against a REAL batch ------------------------- #
     sample = next(iter(train_loader))
     disabled = {t.strip() for t in args.disable.split(",") if t.strip()}
+    if site_col is None or int(sites.max()) == 0:
+        # Recorded in the run manifest rather than left to run as a no-op, so a
+        # later comparison cannot read "we trained with DRO" off this run.
+        disabled |= {"group_dro", "irm"}
+        print("!! single acquisition environment: disabling group_dro and irm")
     tcfg = TrainConfig(
         fold=args.fold, seed=args.seed, backbone_lr=args.backbone_lr,
         head_lr=args.head_lr, accum_steps=args.accum, amp_dtype=args.amp,
@@ -285,7 +338,7 @@ def main() -> int:
         )
     except Exception as exc:
         print(f"\n{exc}\n", file=sys.stderr)
-        print("Hint: --disable kd,ot_ground,contrastive,weak_label,shortcut,irm "
+        print("Hint: --disable kd,ot_ground,contrastive,weak_label,irm "
               "runs image-only.", file=sys.stderr)
         return 2
 
@@ -326,6 +379,12 @@ def main() -> int:
             continue
 
         logits, targets, val_uids = trainer.predict(val_loader)
+        if getattr(trainer, "n_unusable_predicted", 0):
+            # Loud, because a systematic decode failure must not read as a bad
+            # epoch: these studies had no usable series at all and were dropped
+            # from the OOF rather than scored from zero padding.
+            print(f"           !! {trainer.n_unusable_predicted} validation "
+                  f"study(ies) had no usable series and were excluded")
         if len(logits) == 0:
             continue
         # Stable sigmoid: exp(-logits) overflows for the large-magnitude

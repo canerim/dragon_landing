@@ -343,3 +343,46 @@ def test_all_budgets_produce_a_valid_plan(budget):
     assert plan.total_epochs > 0
     sched = LossSchedule(plan)
     assert sched(plan.total_steps - 1)["asl"] > 0
+
+
+def test_tta_view_construction_works_on_the_slots_batch():
+    """The submission notebook builds a TTA view of the batch.
+
+    ``batch.__class__(**batch.__dict__)`` cannot work: ``StudyBatch`` is
+    ``@dataclass(slots=True)`` and has no ``__dict__``.  It raised on the very
+    first study and the notebook's ``except Exception: pass`` swallowed it, so
+    test-time augmentation had been a silent no-op -- indistinguishable from a
+    TTA that runs and does not help.  ``dataclasses.replace`` is the form that
+    works, and this test pins it because the notebook itself is not importable
+    under pytest (it executes Kaggle-only side effects at import).
+    """
+    import dataclasses
+
+    torch = pytest.importorskip("torch")
+    from kairos.data.transforms import MEDIAL_LATERAL_SWAP
+    from kairos.models.system import StudyBatch
+
+    batch = StudyBatch(
+        pixels=torch.rand(1, 1, 2, 5, 8, 8),
+        slice_mask=torch.ones(1, 1, 2, dtype=torch.bool),
+        series_mask=torch.ones(1, 1, dtype=torch.bool),
+        z_mm=torch.zeros(1, 1, 2),
+        family_id=torch.zeros(1, 1, dtype=torch.long),
+        manufacturer_id=torch.zeros(1, 1, dtype=torch.long),
+        fat_sat_id=torch.zeros(1, 1, dtype=torch.long),
+        context=torch.zeros(1, 1, 8),
+        study_uid=["s0"],
+    )
+    assert not hasattr(batch, "__dict__")
+    with pytest.raises(AttributeError):
+        batch.__class__(**{**batch.__dict__, "pixels": batch.pixels})
+
+    view = dataclasses.replace(batch, pixels=batch.pixels.flip(-1))
+    assert view.pixels.shape == batch.pixels.shape
+    assert not torch.equal(view.pixels, batch.pixels)
+    assert view.study_uid == batch.study_uid
+
+    # And the mirror's output permutation must be an involution, or applying it
+    # to the mirrored logits does not undo the mirror.
+    sw = list(MEDIAL_LATERAL_SWAP)
+    assert [sw[sw[i]] for i in range(len(sw))] == list(range(len(sw)))

@@ -130,6 +130,15 @@ class AsymmetricLoss(nn.Module):
             return loss.sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
         if reduction == "per_label":
             return loss.sum(dim=0) / valid.sum(dim=0).clamp_min(1.0)
+        if reduction == "label_contrib":
+            # The *exact additive decomposition* of ``mean`` over labels:
+            # ``label_contrib.sum() == mean``, bit-for-bit up to float
+            # associativity.  ``per_label`` does not have this property (it
+            # divides by the per-label count, not the total), and gradient
+            # surgery needs the exact one -- it subtracts the plain sum of
+            # these terms from ``.grad`` and adds the combined direction back,
+            # so any mismatch silently biases the update.
+            return loss.sum(dim=0) / valid.sum().clamp_min(1.0)
         if reduction == "sum":
             return loss.sum()
         return loss.sum() / valid.sum().clamp_min(1.0)

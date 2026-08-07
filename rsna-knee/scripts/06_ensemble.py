@@ -23,6 +23,7 @@ import numpy as np
 
 from kairos.constants import GROUP_OF_LABEL, LABEL_GROUPS, TARGETS
 from kairos.ensemble.weights import (
+    combine_members,
     greedy_selection,
     nested_evaluate,
     rank_transform,
@@ -127,7 +128,9 @@ def main() -> int:
                 "bootstrap_se": se,
                 "greedy_selection": [names[i] for i in chosen],
                 "greedy_macro": greedy_score,
-                "final_macro": macro_auc(targets, np.einsum("lm,mnl->nl", W, ranked)),
+                # Scored through the *same* combiner the notebook deploys, so
+                # this number is the one the submission will reproduce.
+                "final_macro": macro_auc(targets, combine_members(preds, W)),
             },
             indent=2,
         )

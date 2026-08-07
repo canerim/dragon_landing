@@ -32,12 +32,26 @@ graph term.
 multimodal, image-ensemble) with decoupled KD, feature alignment through a
 learned projector, and attention alignment via a symmetric JS divergence.
 
-:class:`ReportShortcutRegulariser` is the guard rail: it explicitly penalises
-the multimodal teacher for being *more* confident when the report is shuffled
-to a different study than when it is correct.  Without it, the "multimodal
-teacher" converges to a report-only classifier that is useless as a teacher for
-an image-only student, and the failure is invisible in the teacher's own
+:class:`ReportShortcutRegulariser` is the guard rail for a *report-conditioned*
+classifier: it penalises the model for being **more** confident when the report
+is shuffled to a different study than when it is correct.  Without it, such a
+model converges to a report-only classifier that is useless as a teacher for an
+image-only student, and the failure is invisible in the teacher's own
 validation AUC.
+
+**Scope, stated once so nothing here reads as more than it is:**
+:class:`KairosModel <kairos.models.system.KairosModel>` does not build a
+report-conditioned branch, so this regulariser is *not* part of the shipped
+curriculum.  The reasoning is in ``docs/DESIGN.md`` §4.3 and is short: the test
+set has no reports, so such a branch can only pay off through the
+representation -- which :class:`SoftContrastive` and the OT grounding already
+cover -- or as a KD teacher, and a teacher that reads the finding out of the
+report emits logits the student cannot reproduce from pixels.  The class and
+:func:`~kairos.eval.leakage.shuffled_report_audit` stay because they are
+correct and tested and a report-conditioned variant needs both; the objective
+registry declares the model outputs they require, so scheduling them against a
+model that cannot feed them is a startup error rather than a term that quietly
+returns ``None`` every step.
 """
 
 from __future__ import annotations

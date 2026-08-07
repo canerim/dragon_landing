@@ -100,8 +100,7 @@ class LossSchedule:
         "kd",               # teacher distillation
         "group_dro",        # worst-group risk
         "chi2_dro",         # chi-square DRO
-        "irm",              # invariance penalty (text branch only)
-        "shortcut",         # report-shortcut regulariser
+        "irm",              # IRMv1 across acquisition environments
         "attn_entropy",     # attention-collapse hinge
         "moe_balance",      # MoE load balance
         "moe_router_z",     # MoE router z-loss
@@ -164,8 +163,8 @@ def default_plan(*, steps_per_epoch: int, budget: str = "medium") -> CurriculumP
     s1 = Stage(
         name="S1 image-report VLP",
         epochs=0 if budget == "small" else e(4),
-        weights={"contrastive": 1.0, "ot_ground": 0.0, "shortcut": 0.2},
-        weights_end={"contrastive": 1.0, "ot_ground": 0.05, "shortcut": 0.5},
+        weights={"contrastive": 1.0, "ot_ground": 0.0},
+        weights_end={"contrastive": 1.0, "ot_ground": 0.05},
         lr_scale=1.0,
         enable_fine_pass=False,
         notes="soft targets from weak labels + concept graph",
@@ -176,16 +175,16 @@ def default_plan(*, steps_per_epoch: int, budget: str = "medium") -> CurriculumP
         weights={
             "asl": 1.0, "pattern_bce": 0.2, "weak_label": 0.10,
             "attn_entropy": 0.05, "moe_balance": 0.01, "moe_router_z": 1e-3,
-            "ontology": 0.02, "consistency": 0.02,
+            "ontology": 0.02,
         },
         weights_end={
             "asl": 1.0, "pattern_bce": 0.2, "weak_label": 0.05, "ot_ground": 0.03,
             "attn_entropy": 0.05, "moe_balance": 0.01, "moe_router_z": 1e-3,
-            "ontology": 0.02, "consistency": 0.05, "copula": 0.02,
+            "ontology": 0.02, "copula": 0.02,
         },
         lr_scale=1.0,
         enable_fine_pass=False,
-        notes="coarse only; establishes a separable classifier",
+        notes="coarse only; consistency needs the fine head so it starts in S3",
     )
     s3 = Stage(
         name="S3 ranking + fine pass",
@@ -193,12 +192,12 @@ def default_plan(*, steps_per_epoch: int, budget: str = "medium") -> CurriculumP
         weights={
             "asl": 1.0, "auc_margin": 0.05, "pauc": 0.0, "rank_queue": 0.0,
             "attn_entropy": 0.05, "ontology": 0.02, "copula": 0.02,
-            "selector_budget": 0.1, "moe_balance": 0.01,
+            "selector_budget": 0.1, "moe_balance": 0.01, "consistency": 0.02,
         },
         weights_end={
             "asl": 0.6, "auc_margin": 0.20, "pauc": 0.08, "rank_queue": 0.05,
             "attn_entropy": 0.03, "ontology": 0.01, "copula": 0.02,
-            "selector_budget": 0.3, "moe_balance": 0.01,
+            "selector_budget": 0.3, "moe_balance": 0.01, "consistency": 0.05,
         },
         lr_scale=0.3,
         enable_fine_pass=True,

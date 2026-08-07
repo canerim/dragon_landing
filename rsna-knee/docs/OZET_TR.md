@@ -21,7 +21,7 @@ her biri OOF üzerinde ölçülebilir olan farklar — beklenen etki sırasına 
 | 1 | Metrik-doğrudan optimizasyon | "AUC ranking loss, düşük ağırlık, geç" (öneri) | AUC min-max margin **kanıtlanmış özdeşlikle**, two-way partial AUC, nadir etiketler için momentum kuyruk; PESG min-max optimizer |
 | 2 | Fiziksel geometri | Slice sıralaması için doğru formül | Sıralama + **milimetre cinsinden** Fourier pozisyon kodu, metrik rotary attention, metrik ALiBi, SSM'de fiziksel Δ, fiziksel spacing'e resample |
 | 3 | Label-specific yapı | 12 label query | 12 query **+ top-2 MoE (mekanizma taksonomisinden yönlendirilmiş) + Poincaré ontoloji önselı + entailment cone** |
-| 4 | Rapor denetimi | Contrastive + weak label + KD (kavramsal) | **Kutu olmadan** unbalanced optimal transport ile phrase→slice grounding, klinik-benzerlik soft target, **shortcut regularizer + bloklayıcı denetim** |
+| 4 | Rapor denetimi | Contrastive + weak label + KD (kavramsal) | **Kutu olmadan** unbalanced optimal transport ile phrase→slice grounding, klinik-benzerlik soft target, dört durumlu çok dilli weak label — rapor yalnızca **temsili** şekillendirir, hiçbir tahmin dalını koşullamaz |
 | 5 | Domain shift | "Alt grup analizi yap" | Group-DRO **+ standart-hata shrinkage + label standardizasyonu**, χ²-DRO, IRMv1; site AUC farkı birinci sınıf metrik |
 | 6 | Adaptif hesap | Coarse-to-fine top-k fikri | **Eğitilmiş** Gumbel top-k + güven/belirsizlik kapısı + bütçe kaybı + ölçülmüş Pareto eğrisi + **kapalı çevrim runtime governor** |
 | 7 | İstatistik | Bootstrap öner | **DeLong eşleşmiş test**, hasta-kümeli bootstrap, **iç içe (nested) ensemble doğrulaması**, 10'lu shortcut denetim paketi (5'i bloklayıcı) |
@@ -101,17 +101,32 @@ Gradyan **zarf teoremi** ile: optimumda $\partial\mathrm{OT}/\partial C=T^\star$
 yani plan detach edilir ve sadece $\langle T^\star,C\rangle$ üzerinden geri yayılır.
 İterasyonları açmaktan hem ucuz hem çok daha kararlı.
 
-**Kısayol koruması** — bu yönün tamamını batırabilecek arıza modu, "çok modlu
-öğretmen"in gizlice rapor-sınıflandırıcısına dönüşmesidir. Kendi validasyon
-AUC'sinde görünmez, ama image-only öğrenci için değersizdir. Ceza:
+**Rapor-koşullu bir tahmin dalı neden yok.** Akla gelen sonraki adım, eğitimde
+raporu okuyan ve image-only bir öğrenciye damıtılan bir model. Bunu bilerek
+kurmuyoruz. Böyle bir dalın skora giden yalnızca iki yolu var. Birincisi
+*temsil*: görüntü kodlayıcısını rapor semantiğine hizalamak — bu yol zaten
+soft-target contrastive ve OT grounding ile alınıyor, üstelik çıkarım grafiğine
+hiç metin sokmadan. İkincisi *KD öğretmeni*: bu yol burada işlemiyor, çünkü
+rapor bulguyu açıkça yazar; rapor-koşullu öğretmenin logitleri etiketlerin
+gürültülü bir kopyasıdır ve bunları damıtmak, denetimli terimin zaten kullandığı
+hedefler üzerinde label smoothing'e indirgenir. Öğrencinin piksellerden
+çıkaramayacağı bir bilgiden "dark knowledge" doğmaz. S4'te gerçekten damıttığımız
+öğretmen, logitleri piksellerden **yeniden üretilebilir** olan çapraz-eğitilmiş
+OOF topluluğudur.
+
+Böyle bir dalı kuran biri için koruma hazır ve testli: `ReportShortcutRegulariser`
 
 $$
 \mathbb E[\mathrm{ReLU}(\mathcal C(z^{\text{karışık}})-\mathcal C(z^{\text{doğru}})+\delta)]
 +\eta\,\mathbb E[\mathrm{KL}(\sigma(z^{\text{karışık}})\|\sigma(z^{\text{görüntü}}))]
 $$
 
-Her epoch loglanan `report_reliance` skaleri, çok modlu öğretmenin gerçek olup
-olmadığını söyleyen **tek sayıdır**.
+cezasını uygular, `shuffled_report` da bunun değerlendirme zamanındaki bloklayıcı
+karşılığıdır. İkisi de varsayılan curriculum'da **değil**. Objective kayıt
+defteri her terimin okuduğu model çıktılarını bildirir ve `validate_schedule`
+besleyemeyeceği bir terimi programlayan koşuyu başlatmayı reddeder — bu boşluk
+tam olarak böyle bulundu: terim S1 boyunca 0.5 ağırlıkla programlanmış ve her
+adımda `None` döndürüyordu.
 
 ---
 
@@ -204,7 +219,7 @@ bilinen bir yolunu yakalar:
 | Denetim | Başarısızlık ne demek | Bloklayıcı |
 |---------|----------------------|:---:|
 | `shuffled_label` | Tahmin/etiket satırları hizasız — pipeline'ın en yıkıcı ve en kolay kaçırılan hatası | ✅ |
-| `shuffled_report` | Çok modlu model aslında text-only | ✅ |
+| `shuffled_report` | Rapor-koşullu model aslında text-only (opsiyonel: yalnızca böyle bir dal kurulursa çalışır) | ✅ |
 | `duplicate_hash` | Aynı çalışma iki fold'da | ✅ |
 | `embedding_neighbour` | Yakın-kopya çalışmalar fold sınırını aşıyor | ✅ |
 | fold-hash kontrolü | OOF matrisi izlenemiyor | ✅ |
@@ -292,7 +307,7 @@ doğru olması gerektiğine** göre:
 | 2 | **Ölçülmüş Kaggle runtime** (dummy submission) | Uçtan uca <9 saat, pay bırakarak |
 | 3 | Rapor parser + text-only baseline | Dil başına eşleşmeyen cümle denetimi incelendi |
 | 3–4 | Label query + cross-sequence fusion | Macro-AUC ↑ **ve** en az 4 zor etiket ↑ |
-| 4–5 | Image–report pretraining | Aynı bütçede image-only OOF ↑; `report_reliance` > 0 |
+| 4–5 | Image–report pretraining | Aynı bütçede image-only OOF ↑ (rapor yalnızca temsili şekillendirir) |
 | 5–6 | Coarse-to-fine adaptif | Aynı AUC'de daha düşük runtime ya da tersi |
 | 6–7 | 3D/Video-Swin çeşitlilik dalı | 1–3 ile OOF artık korelasyonu <0.9 |
 | 7–8 | Ranking fine-tune | Macro-AUC ↑, worst-label AUC ↓ değil |

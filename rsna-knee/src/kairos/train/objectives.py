@@ -23,7 +23,7 @@ Terms fall into three groups:
 
 *Batch-conditional* -- need a field the dataloader may or may not populate:
 ``group_dro`` (``group_id``), ``irm`` (``env_id``), ``weak_label``
-(``weak_labels``), ``contrastive``/``shortcut`` (``text_embedding``),
+(``weak_labels``), ``contrastive`` (``text_embedding``),
 ``ot_ground`` (``phrase_embedding``), ``kd`` (``teacher_logits``).
 
 *Head-conditional* -- need an auxiliary module: ``mim`` and ``cross_plane``
@@ -123,6 +123,20 @@ class Term:
     module: nn.Module | None = None
     requires: tuple[str, ...] = ()
     note: str = ""
+    #: Keys the *model output dict* must contain.  ``requires`` alone covers
+    #: only the batch, which left a blind spot the validator was written to
+    #: close: ``shortcut`` needs three logit variants that the shipped model
+    #: never emits, carried a ``module`` (so the "inert note" heuristic skipped
+    #: it), and was scheduled at weight 0.5 for the whole of S1 while returning
+    #: ``None`` every single step.  Declaring output preconditions makes that a
+    #: startup error instead of a silent one.
+    requires_outputs: tuple[str, ...] = ()
+    #: Optional exact additive decomposition of ``fn`` over the twelve labels:
+    #: a ``(L,)`` tensor whose sum equals ``fn(...)``.  Gradient surgery needs
+    #: per-task losses, and it needs them to sum to *exactly* the term it is
+    #: replacing -- see :meth:`kairos.optim.pesg.GradientSurgery.correct_`.
+    #: A term without one simply does not take part in surgery.
+    per_label: Callable[[dict, Any, dict], torch.Tensor | None] | None = None
 
     def __call__(self, outputs, batch, state):
         return self.fn(outputs, batch, state)
@@ -213,14 +227,21 @@ def build_objectives(
 
     terms: dict[str, Term] = {}
 
-    def reg(name, fn, *, module=None, requires=(), note=""):
-        terms[name] = Term(name, fn, module, tuple(requires), note)
+    def reg(name, fn, *, module=None, requires=(), note="", per_label=None,
+            requires_outputs=()):
+        terms[name] = Term(
+            name=name, fn=fn, module=module, requires=tuple(requires), note=note,
+            requires_outputs=tuple(requires_outputs), per_label=per_label,
+        )
 
     # -- always available ------------------------------------------------ #
 
     reg("asl", lambda o, b, s: (
         None if _targets(b) is None else asl(o["logits"], b.targets)
-    ), module=asl, requires=("targets",))
+    ), module=asl, requires=("targets",), per_label=lambda o, b, s: (
+        None if _targets(b) is None
+        else asl(o["logits"], b.targets, reduction="label_contrib")
+    ))
 
     if pattern is not None:
         reg("pattern_bce", lambda o, b, s: (
@@ -232,7 +253,10 @@ def build_objectives(
 
     reg("auc_margin", lambda o, b, s: (
         None if _targets(b) is None else aucm(o["logits"], b.targets)
-    ), module=aucm, requires=("targets",))
+    ), module=aucm, requires=("targets",), per_label=lambda o, b, s: (
+        None if _targets(b) is None
+        else aucm(o["logits"], b.targets, reduction="label_contrib")
+    ))
 
     reg("pauc", lambda o, b, s: (
         None if _targets(b) is None else pauc(o["logits"], b.targets)
@@ -351,22 +375,49 @@ def build_objectives(
 
     reg("ot_ground", _ot, module=ot, requires=("phrase_embedding", "phrase_mask"))
 
+    _SHORTCUT_OUTPUTS = (
+        "logits_report", "logits_report_shuffled", "logits_image_only",
+    )
+
     def _shortcut(o, b, s):
-        """Requires the caller to have produced the three logit variants."""
-        need = ("logits_report", "logits_report_shuffled", "logits_image_only")
-        if not all(k in o for k in need):
+        """Anti-shortcut margin for a *report-conditioned* classifier.
+
+        :class:`~kairos.models.system.KairosModel` does not build one, on
+        purpose: the test set has no reports, so a report-conditioned branch
+        can only pay off through the representation (which ``contrastive`` and
+        ``ot_ground`` already give us) or as a KD teacher -- and a teacher that
+        reads the finding out of the report produces logits the student cannot
+        reproduce from pixels, so distilling them is just label smoothing.
+
+        The term stays registered because the regulariser is correct and tested
+        and a report-conditioned variant may want it; it declares its output
+        preconditions so that scheduling it against a model that cannot feed it
+        is a startup error rather than a term that quietly returns ``None``
+        forever.  It is *not* in the shipped curriculum.
+        """
+        if not all(k in o for k in _SHORTCUT_OUTPUTS):
             return None
-        return shortcut(o[need[0]], o[need[1]], o[need[2]])["total"]
+        return shortcut(*(o[k] for k in _SHORTCUT_OUTPUTS))["total"]
 
     reg("shortcut", _shortcut, module=shortcut,
-        note="needs outputs logits_report / logits_report_shuffled / logits_image_only")
+        requires_outputs=_SHORTCUT_OUTPUTS,
+        note="needs a report-conditioned branch; the shipped model has none")
 
     def _kd(o, b, s):
         if not _has(b, "teacher_logits"):
             return None
+        # Attention KD is the component that transfers *where the teacher
+        # looks*, and it is the most valuable one for the rare osseous labels.
+        # Hard-coding student_attn=None disabled it even when the batch carried
+        # teacher attention, silently reducing KD to logit matching.
+        st_attn = o.get("slice_attention")
+        if st_attn is not None and st_attn.dim() == 4:
+            B, Nseq, L, S = st_attn.shape
+            st_attn = st_attn.permute(0, 2, 1, 3).reshape(B, L, Nseq * S)
         return kd(
             o["logits"], b.teacher_logits,
-            student_attn=None, teacher_attn=getattr(b, "teacher_attention", None),
+            student_attn=st_attn,
+            teacher_attn=getattr(b, "teacher_attention", None),
         )["total"]
 
     reg("kd", _kd, module=kd, requires=("teacher_logits",))
@@ -404,11 +455,12 @@ def validate_schedule(
     schedule: LossSchedule,
     *,
     sample_batch: Any | None = None,
+    sample_outputs: Mapping[str, Any] | None = None,
     strict: bool = True,
 ) -> list[str]:
     """Check that every term the schedule activates can actually be computed.
 
-    Two levels:
+    Three levels:
 
     1. **Registry coverage.**  Every term with a non-zero weight at *any* step
        must have an entry.  A missing entry is always fatal: the schedule is
@@ -420,6 +472,13 @@ def validate_schedule(
        a dataloader that does not emit teacher logits or phrase embeddings --
        the run would otherwise train a strictly smaller objective and say
        nothing.
+
+    3. **Output coverage.**  If ``sample_outputs`` is given (the trainer runs
+       one no-grad forward pass to get it), every scheduled term's
+       ``requires_outputs`` keys must be present.  This is the level that was
+       missing: a term can be fully registered, own a module, need nothing from
+       the batch, and still be dead because the *model* does not emit what it
+       reads.
 
     Returns the list of problems; raises :class:`MissingObjectiveError` when
     ``strict`` (the default) and the list is non-empty.
@@ -445,7 +504,12 @@ def validate_schedule(
                 f"curriculum."
             )
             continue
-        if getattr(term, "note", "") and term.module is None and not term.requires:
+        # ``term.module is None`` used to be part of this test, which made it
+        # unfirable for exactly the terms that need it most: owning parameters
+        # says the trainer must collect them, not that the term is computable.
+        # ``shortcut`` owns a module, needs nothing from the batch, and can
+        # never be computed by the shipped model -- and slipped through.
+        if getattr(term, "note", "") and not term.requires and not term.requires_outputs:
             problems.append(f"'{name}' is scheduled but inert: {term.note}")
         if sample_batch is not None:
             missing = [f for f in term.requires if getattr(sample_batch, f, None) is None]
@@ -454,6 +518,17 @@ def validate_schedule(
                     f"'{name}' is scheduled (max weight {w:g}) but the batch is "
                     f"missing: {', '.join(missing)}. The term would be silently "
                     f"skipped every step."
+                )
+        if sample_outputs is not None and term.requires_outputs:
+            missing_out = [
+                k for k in term.requires_outputs if sample_outputs.get(k) is None
+            ]
+            if missing_out:
+                problems.append(
+                    f"'{name}' is scheduled (max weight {w:g}) but the model does "
+                    f"not emit: {', '.join(missing_out)}. The term would be "
+                    f"silently skipped every step."
+                    + (f" Note: {term.note}" if term.note else "")
                 )
 
     if problems and strict:

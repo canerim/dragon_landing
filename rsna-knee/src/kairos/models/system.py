@@ -108,6 +108,10 @@ class StudyBatch:
     targets: torch.Tensor | None = None  # (B, L)
     group_id: torch.Tensor | None = None  # (B,) site×language×scanner bucket
     study_uid: list[str] | None = None
+    #: ``(B,)`` bool -- False for a study with no usable series.  Its row is
+    #: pure padding, so its targets are NaN and its prediction is fabricated;
+    #: ``Trainer.predict`` drops it from the OOF matrix rather than scoring it.
+    study_valid: torch.Tensor | None = None
     fine_pixels: torch.Tensor | None = None  # (B, Nseq, S, C, Hf, Wf) if precomputed
 
     # ---- optional supervision channels -------------------------------- #
@@ -292,8 +296,11 @@ class KairosModel(nn.Module):
             return series_mask
         drop = torch.rand_like(series_mask, dtype=torch.float32) < self.cfg.sequence_dropout
         out = series_mask & ~drop
-        # Never drop every series of a study.
-        empty = ~out.any(dim=1)
+        # Never drop every series of a study -- but only restore studies that
+        # *had* a series.  ``argmax`` on an all-False row returns 0, so an
+        # unconditional restore force-marks padded slot 0 of an empty study as
+        # a genuine series, turning "no data" into "one series of zeros".
+        empty = (~out.any(dim=1)) & series_mask.any(dim=1)
         if bool(empty.any()):
             first = series_mask.float().argmax(dim=1)
             out[empty, first[empty]] = True
@@ -400,8 +407,15 @@ class KairosModel(nn.Module):
         want = sel["mask"] & need[:, :, None]
         union = want.any(dim=1) & valid_flat
         out["fine_fraction"] = union.sum(dim=1).float() / valid_flat.sum(dim=1).clamp_min(1).float()
+        # The budget term must be differentiable or the selector can never
+        # learn to respect it.  ``union`` is boolean, so a count over it is a
+        # constant; the straight-through weights are the gradient-carrying
+        # quantity.  Max over labels is the smooth OR: a slice costs one fine
+        # forward whether one label wants it or five.
+        soft_sel = (sel["weights"] * need[:, :, None].to(sel["weights"].dtype))
+        soft_union = soft_sel.max(dim=1).values * valid_flat.to(soft_sel.dtype)
         out["selector_budget"] = self.selector.budget_loss(
-            {"n_selected": union.sum(dim=1).float()}, cfg.fine_budget_fraction, valid_flat
+            {"n_selected": soft_union.sum(dim=1)}, cfg.fine_budget_fraction, valid_flat
         )
 
         fine_pixels = batch.fine_pixels

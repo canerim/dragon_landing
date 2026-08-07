@@ -272,7 +272,18 @@ def main() -> int:
                   "and inspect series_description before training.")
 
     # -- study-level rollup ---------------------------------------------- #
-    g = df[usable] if usable.any() else df
+    # Never silently fall back to "use everything" when nothing passed QC:
+    # that turns a total pipeline failure into a manifest that looks fine.
+    if not usable.any():
+        print("\n!! NO series passed QC. Refusing to write a rollup built from "
+              "unusable data -- fix decoding or lower --min-slices first.",
+              file=sys.stderr)
+        return 1
+    dropped = sorted(set(df["StudyInstanceUID"]) - set(df.loc[usable, "StudyInstanceUID"]))
+    if dropped:
+        print(f"\n{len(dropped)} study(ies) have no usable series and are excluded "
+              f"from the rollup; first few: {dropped[:5]}")
+    g = df[usable]
     studies_df = (
         g.groupby("StudyInstanceUID")
         .agg(
@@ -306,8 +317,20 @@ def main() -> int:
         if missing:
             print(f"!! labels CSV missing target columns: {missing}", file=sys.stderr)
         studies_df = _merge_coalescing(studies_df, lab, on="StudyInstanceUID")
-        have = studies_df[list(set(TARGETS) & set(studies_df.columns))].notna().all(axis=1)
+        # ``reindex``, not ``set(TARGETS) & set(columns)``.  The intersection
+        # selects *zero* columns when the label CSV uses different names, and
+        # ``.all(axis=1)`` over zero columns is True for every row -- so the
+        # script printed "labelled studies: 4500/4500" right after warning that
+        # every target column was missing, and the real failure only surfaced
+        # one stage later in 01_make_folds.  ``reindex`` inserts the absent
+        # columns as NaN, which is the truth.  (It also fixes a partial join:
+        # 2 of 12 targets present used to report rows as fully labelled.)
+        have = studies_df.reindex(columns=list(TARGETS)).notna().all(axis=1)
         print(f"\nlabelled studies: {int(have.sum())}/{len(studies_df)}")
+        if missing:
+            print("!! the manifest is unusable for training until the labels CSV "
+                  "carries every target column", file=sys.stderr)
+            return 1
 
     if args.reports and args.reports.exists():
         rep = pd.read_csv(args.reports)

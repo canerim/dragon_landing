@@ -31,8 +31,13 @@ Six claims, each implemented and each falsifiable on out-of-fold data:
 4. **The report is privileged information, never a test-time shortcut.**
    Soft-target contrastive pretraining, unbalanced optimal-transport
    phrase→slice grounding without boxes, four-state multilingual weak labels,
-   cross-fitted distillation — and a shortcut regulariser plus a *blocking*
-   audit that refuses a multimodal teacher which is secretly a text classifier.
+   cross-fitted distillation. The report shapes the *representation*; it never
+   conditions a prediction, because the test set has no reports and a
+   report-conditioned teacher produces logits no image-only student can
+   reproduce. `ReportShortcutRegulariser` and the blocking `shuffled_report`
+   audit exist for anyone who does build such a branch — neither is in the
+   shipped curriculum, and `validate_schedule` now refuses to start a run that
+   schedules a term the model cannot feed.
 5. **Optimise the metric, after the classifier exists.** AUC min-max margin
    (verified against the pairwise surrogate at the saddle point), two-way
    partial AUC via implicit-differentiated soft top-k, and a momentum memory
@@ -161,7 +166,7 @@ src/kairos/
     auc.py                AUC min-max margin, two-way pAUC, memory-queue ranking
     ot.py                 log-domain balanced/unbalanced Sinkhorn, phrase→slice OT
     supervised.py         ASL, pattern-rarity BCE, Gaussian copula (composite NLL)
-    multimodal.py         soft-target contrastive, decoupled KD, shortcut regulariser
+    multimodal.py         soft-target contrastive, decoupled KD, report-shortcut guard (opt-in)
     robust.py             Group-DRO (+SE shrinkage), CVaR, χ²-DRO, IRMv1
   optim/pesg.py           PESG min-max, ASAM, PCGrad/CAGrad/Aligned-MTL
   train/
@@ -232,7 +237,17 @@ and the backbone. A selection of the rest:
 - Soft top-k sums to *k* and is differentiable through the implicit `ν`
 - Spectral normalisation bounds the empirical Lipschitz ratio at ≤ 1.05
 - SNGP variance is larger far from the training distribution
-- Aligned-MTL is invariant to a 100× rescale of one task's loss
+- Aligned-MTL is invariant to a 100× rescale of one task's loss, is
+  1-homogeneous, survives a rank-deficient gradient matrix without collapsing
+  the update to zero, and its composed gradient equals `g_other + S(G)` exactly
+- The min-max block is still routed to PESG after `.to(device)` rebuilds every
+  `Parameter` — the failure that only ever appears on GPU
+- `rank_transform` leaves a single model's AUC bit-identical even with heavy
+  ties, and `combine_members` is a monotone map of the combined ranking
+- A study that failed to decode is marked invalid, its targets NaN-ed, and it
+  is dropped from the OOF rather than scored from padding
+- DataLoader workers draw independent augmentations (the test fails if the
+  `worker_init_fn` is removed)
 - Folds never split a patient; the rarest label's per-fold prevalence stays
   within 40 % relative
 - Resampling gives the same physical field of view from 0.25 mm and 1.0 mm input
@@ -246,8 +261,8 @@ and the backbone. A selection of the rest:
 - Turkish post-posed negation, Japanese post-posed negation, and compartment
   resolution all produce the right assertion
 
-Ten real bugs were found by these tests during development, each documented in
-the code at the site of its fix:
+Every bug below was found by these tests or by an adversarial audit of the
+working tree, and each is documented in the code at the site of its fix:
 
 | bug | why it mattered |
 |---|---|
@@ -266,6 +281,21 @@ the code at the site of its fix:
 | optimiser never stepped when `len(loader) < accum_steps` | short folds and debug runs trained nothing |
 | the no-weights exit path validated its own constant fallback | second instance of the same safety-net bug |
 | `shuffled_label` used a fixed tolerance | false-alarmed on any small eval; a blocking audit that cries wolf gets ignored |
+| EMA applied Adam-style bias correction to a shadow initialised *from the weights* | scaled every weight by 1000 at step 1 — and the EMA is what we score and ship |
+| all 40 objective-module parameters were in no optimiser | stage S0 ran masked-image modelling against a frozen decoder for six epochs |
+| `selector_budget` was computed from a boolean count | the adaptive-compute budget carried no gradient at all |
+| OOF scored the EMA, the checkpoint stored the raw weights | the matrix and the shipped model described different networks |
+| Aligned-MTL was constructed and never called | a documented method that changed nothing |
+| PESG was swapped in by *stage name*, at a fixed LR, and rebuilt each stage | `auc_margin` is live in S4 too, so α stopped being stepped at the S3/S4 boundary |
+| `_auc_ascent` / `_minimax` were Python attributes on a `Parameter` | `nn.Module._apply` rebuilds Parameters on any device move, so the whole min-max block silently reverted to AdamW **on GPU only** — CPU tests passed |
+| the flip TTA never permuted the labels | mirrored knees scored `Medial OA` as `Lateral OA` at submission time |
+| the TTA view was built with `batch.__class__(**batch.__dict__)` | `StudyBatch` is `slots=True` and has no `__dict__`; it raised into a bare `except: pass`, so TTA had been a silent no-op |
+| ensemble weights were fitted on ranks and deployed on probabilities | the notebook optimised one objective and shipped another |
+| `rank_transform` used ordinal ranks | not a monotone map of its input, so it moved a single model's AUC by ~2e-4 |
+| `collate_studies` emitted an all-False `series_mask` row | a study that failed to decode was scored from zero padding |
+| one numpy `Generator` shared by every DataLoader worker | `--workers 4` divided augmentation diversity by four |
+| the rare-label `covered` set | short-circuited the quota whenever one pick satisfied two labels |
+| `set(TARGETS) & set(columns)` on an empty intersection | `.all(axis=1)` over zero columns is True: "labelled studies: 4500/4500" right after warning that every label column was missing |
 
 ---
 

@@ -212,12 +212,20 @@ class IRMPenalty(nn.Module):
         \sum_{e} \big\lVert \nabla_{w|w=1}\,
             \mathcal R_e(w \cdot f_\theta) \big\rVert^2
 
-    with a dummy scalar classifier :math:`w = 1`.  Its role in this system is
-    narrow and deliberate: it is applied **only to the text-conditioned branch**
-    during multimodal pretraining, to discourage the model from learning
-    site-specific *report template* features that predict the label at one
-    centre and nowhere else.  Applied to the image branch it mostly hurts, and
-    the ablation table in ``docs/ABLATIONS.md`` records that.
+    with a dummy scalar classifier :math:`w = 1`.
+
+    The environments here are *acquisition* environments -- the (site, scanner
+    vendor, field strength) buckets stamped into ``StudyRecord.env_index`` --
+    and the invariance we are asking for is that the optimal rescaling of the
+    logits be the same at every centre.  A feature that needs a different gain
+    at Site 3 than at Site 7 is a feature about Site 3, not about the knee, and
+    on a 16-site test set that is exactly what does not transfer.
+
+    Scope, stated plainly because the alternative is a claim we have not
+    measured: this is applied to the image classifier, it is scheduled in S4
+    only, and we have no ablation of our own that isolates its contribution --
+    the justification is Arjovsky et al.'s, plus the fact that the competition
+    metric is macro-AUC over a site distribution that differs from training.
 
     Ramp the weight in slowly (0 for the first 2 epochs, then to 1e2–1e4): a
     large IRM penalty from step 0 prevents the model from learning anything at

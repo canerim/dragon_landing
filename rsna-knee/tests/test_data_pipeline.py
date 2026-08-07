@@ -5,8 +5,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from kairos.constants import Plane, Weighting
+from kairos.constants import NUM_TARGETS, Plane, Weighting
 from kairos.data.dataset import (
+    SeriesRecord,
+    StudyRecord,
     _bilinear_resize,
     foreground_mask,
     resample_to_spacing,
@@ -14,6 +16,20 @@ from kairos.data.dataset import (
     select_slices,
     stack_neighbours,
 )
+
+
+def _record_with_series(i, *, size=32, n_slices=6, planted=True):
+    """One sagittal study, shaped the way the loader produces them."""
+    rng = np.random.default_rng(i)
+    v = rng.normal(0, 0.3, (n_slices, size, size)).astype(np.float32)
+    if planted:
+        v[:, 4:8, 3:8] += 4.0
+    rec = StudyRecord(study_uid=f"s{i}", series=[SeriesRecord(
+        f"{i}.0", 1, Plane.SAGITTAL, v,
+        np.arange(n_slices, dtype=np.float32) * 3.0, 3.0, 0.5,
+    )])
+    rec.labels = np.zeros(NUM_TARGETS, dtype=np.float32)
+    return rec
 from kairos.data.sequence_taxonomy import classify_series, infer_fat_sat, infer_weighting
 
 
@@ -207,3 +223,128 @@ def test_classify_series_falls_back_when_fat_sat_variant_is_missing():
     ds = FakeDS(RepetitionTime=500, EchoTime=12, SeriesDescription="ax t1 fs")
     fam = classify_series(ds, plane=Plane.AXIAL)
     assert fam.plane == Plane.AXIAL and fam.weighting == Weighting.T1
+
+
+# --------------------------------------------------------------------------- #
+# Studies that could not be decoded                                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_collate_marks_an_unusable_study_invalid_and_nans_its_targets():
+    """A study with no usable series is all padding.
+
+    Left alone it is worse than useless: fusion attention over an all-False
+    mask is uniform over padded slots, the head emits finite logits from zeros,
+    and those logits get scored against the study's *real* targets -- pure
+    padding gradient in training, a fabricated row in the OOF matrix.
+    """
+    torch = pytest.importorskip("torch")
+    from kairos.data.dataset import collate_studies
+
+    good = _record_with_series(0)
+    bad = StudyRecord(study_uid="broken", series=[], errors=["no usable series"])
+    bad.labels = np.zeros(NUM_TARGETS, dtype=np.float32)
+
+    batch = collate_studies([good, bad], device="cpu")
+    assert batch.study_valid.tolist() == [True, False]
+    assert torch.isfinite(batch.targets[0]).all()
+    assert torch.isnan(batch.targets[1]).all(), "padding must not be supervised"
+
+    # And the reverse order, which used to allocate the wrong spatial size.
+    batch2 = collate_studies([bad, good], device="cpu")
+    assert batch2.study_valid.tolist() == [False, True]
+    assert batch2.pixels.shape[-1] == batch.pixels.shape[-1]
+
+
+def test_collate_reads_the_spatial_size_from_any_record_not_just_the_first():
+    """`records[0]` may be the failed study; sampling it made the allocation
+    batch-order dependent and blew up at a random step deep into training."""
+    pytest.importorskip("torch")
+    from kairos.data.dataset import collate_studies
+
+    good = _record_with_series(1, size=48)
+    bad = StudyRecord(study_uid="broken", series=[])
+    assert collate_studies([bad, good], device="cpu").pixels.shape[-1] == 48
+    assert collate_studies([good, bad], device="cpu").pixels.shape[-1] == 48
+
+
+def test_collate_rejects_a_batch_with_mixed_spatial_sizes():
+    pytest.importorskip("torch")
+    from kairos.data.dataset import collate_studies
+
+    with pytest.raises(ValueError, match="different in-plane sizes"):
+        collate_studies([_record_with_series(0, size=32),
+                         _record_with_series(1, size=48)], device="cpu")
+
+
+def test_modality_dropout_does_not_invent_a_series_for_an_empty_study():
+    """``argmax`` on an all-False row returns 0, so an unconditional restore
+    force-marks padded slot 0 as a genuine series."""
+    torch = pytest.importorskip("torch")
+    from kairos.models.backbones import BackboneSpec
+    from kairos.models.system import KairosConfig, KairosModel
+
+    model = KairosModel(KairosConfig(
+        backbone=BackboneSpec(pretrained=False, in_chans=5), dim=32, agg_depth=1,
+        agg_heads=4, sngp_features=32, n_experts=2, sequence_dropout=1.0,
+    ))
+    model.train()
+    mask = torch.tensor([[True, True], [False, False]])
+    out = model._apply_modality_dropout(mask)
+    assert bool(out[0].any()), "a real study must keep at least one series"
+    assert not bool(out[1].any()), "an empty study must stay empty"
+
+
+def test_rare_label_quota_is_honoured_when_a_pick_covers_two_labels():
+    """The `covered` set marked a label fully satisfied after one co-occurring
+    pick -- correct only at quota 1, and it also made the have/need accounting
+    dead code that always saw have == 0."""
+    from kairos.data.loader import ClassAwareBatchSampler, SamplerConfig
+
+    rng = np.random.default_rng(0)
+    N = 300
+    y = np.zeros((N, NUM_TARGETS), dtype=np.float32)
+    y[:, 0] = (rng.random(N) < 0.30)            # common, not rare
+    a, b = 1, 2                                  # two rare labels
+    a_idx = rng.choice(N, 12, replace=False)
+    y[a_idx, a] = 1.0
+    y[a_idx[0], b] = 1.0                         # b's only positive also has a
+    y[rng.choice(N, 2, replace=False), b] = 1.0
+
+    cfg = SamplerConfig(batch_size=12, seed=1, min_positives_per_rare_label=2)
+    sampler = ClassAwareBatchSampler(y, cfg)
+    short = sum(1 for batch in sampler if y[batch, a].sum() < 2)
+    assert short == 0, f"{short} batches missed the quota for the co-occurring label"
+
+
+def test_dataloader_workers_get_independent_augmentation_streams():
+    """One numpy Generator bound in the parent is copied into every worker, and
+    torch's per-worker seeding cannot reach a Generator held on the dataset --
+    so all workers replayed the identical augmentation stream."""
+    pytest.importorskip("torch")
+    from kairos.data.loader import SamplerConfig, StudyDataset, build_dataloader
+    from kairos.data.transforms import AugmentConfig
+
+    labels = (np.random.default_rng(0).random((8, NUM_TARGETS)) < 0.4).astype(np.float32)
+
+    def load(uid):
+        # Every study has *identical* pixels, so any difference in the output
+        # can only come from the augmentation draw.  With different base
+        # content the test passes even when the streams are in lockstep, which
+        # is exactly how this bug stayed hidden.
+        r = _record_with_series(0, planted=False)
+        r.study_uid = uid
+        r.labels = labels[int(uid[1:])]
+        return r
+
+    ds = StudyDataset([f"s{i}" for i in range(8)], load_fn=load, labels=labels,
+                      augment=AugmentConfig(seed=7, noise_sigma=1.0, blur_prob=0.0))
+    loader = build_dataloader(
+        ds, sampler_cfg=SamplerConfig(batch_size=1, shuffle=False, drop_last=False),
+        num_workers=2, balanced=False,
+    )
+    firsts = [float(b.pixels[0, 0, 0, 0, 0, 0]) for b in loader]
+    # Worker 0 handles samples 0,2,4,... and worker 1 handles 1,3,5,...  With a
+    # shared Generator the two streams are byte-identical in pairs.
+    pairs = [(firsts[i], firsts[i + 1]) for i in range(0, len(firsts) - 1, 2)]
+    assert not all(a == b for a, b in pairs), f"workers are in lockstep: {firsts}"

@@ -125,8 +125,7 @@ class AUCMarginLoss(nn.Module):
         self.a = nn.Parameter(torch.zeros(num_labels))
         self.b = nn.Parameter(torch.zeros(num_labels))
         self.alpha = nn.Parameter(torch.zeros(num_labels))
-        # Tag alpha so PESG knows to ascend rather than descend on it.
-        self.alpha._auc_ascent = True  # type: ignore[attr-defined]
+        self._tag_minimax()
 
         if prevalence is not None:
             self.register_buffer("_p_fixed", prevalence.float().clone())
@@ -136,6 +135,46 @@ class AUCMarginLoss(nn.Module):
         self.register_buffer("_p_ema", torch.full((num_labels,), float("nan")))
 
     # ------------------------------------------------------------------ #
+
+    def _tag_minimax(self) -> None:
+        """(Re-)mark the saddle-point parameters.
+
+        ``_auc_ascent`` means "ascend, then project onto :math:`\\alpha\\ge 0`";
+        ``_minimax`` means "hand this to PESG, not to AdamW".
+
+        This has to be re-applied after every ``_apply`` because a plain Python
+        attribute on a Parameter **does not survive a device move**.
+        ``nn.Module._apply`` keeps the object only when
+        ``torch._has_compatible_shallow_copy_type`` holds, which it does for a
+        dtype cast but *not* for cpu->cuda: there it constructs
+        ``Parameter(param_applied, requires_grad)`` and every user attribute is
+        dropped.  The consequence was invisible on CPU and severe on GPU --
+        ``build_objectives(..., device='cuda')`` untagged ``alpha``, so PESG
+        took the *descent* branch on an objective that is concave in
+        :math:`\\alpha`, ``project()`` pinned it at 0, and the whole
+        :math:`A_3` block -- the margin, the entire ranking pressure -- was
+        identically zero while the reported loss went *down*.
+
+        :meth:`minimax_parameters` is the authoritative accessor; the tags are
+        kept for anything that still reads them.
+        """
+        self.alpha._auc_ascent = True  # type: ignore[attr-defined]
+        for p in (self.a, self.b, self.alpha):
+            p._minimax = True  # type: ignore[attr-defined]
+
+    def _apply(self, *args, **kwargs):  # noqa: D102 - see _tag_minimax
+        out = super()._apply(*args, **kwargs)
+        out._tag_minimax()
+        return out
+
+    def minimax_parameters(self) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+        """``(descent, ascent)`` -- the saddle-point block, by identity.
+
+        Resolved through attribute access, so it always returns the parameters
+        the module *currently* owns rather than whatever objects existed when
+        some earlier caller looked.
+        """
+        return [self.a, self.b], [self.alpha]
 
     def _prevalence(self, y: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         if self._p_fixed.numel() == self.num_labels:
@@ -158,6 +197,7 @@ class AUCMarginLoss(nn.Module):
         *,
         mask: torch.Tensor | None = None,
         sample_weight: torch.Tensor | None = None,
+        reduction: str | None = None,
     ) -> torch.Tensor:
         """
         Parameters
@@ -169,6 +209,10 @@ class AUCMarginLoss(nn.Module):
             masked automatically.
         sample_weight
             ``(B,)`` or ``(B, L)`` non-negative weights (e.g. from Group DRO).
+        reduction
+            Overrides ``self.reduction`` for this call.  ``'label_contrib'``
+            returns the exact additive decomposition of ``'mean'`` over labels
+            (it sums to ``'mean'``), which is what gradient surgery consumes.
         """
         h = torch.sigmoid(logits)
         y = torch.nan_to_num(targets, nan=0.0)
@@ -210,10 +254,13 @@ class AUCMarginLoss(nn.Module):
         per_label = (A1 + A2 + A3) * have_both
         denom = have_both.sum().clamp_min(1.0)
 
-        if self.reduction == "none":
+        red = reduction or self.reduction
+        if red == "none":
             return per_label
-        if self.reduction == "sum":
+        if red == "sum":
             return per_label.sum()
+        if red == "label_contrib":
+            return per_label / denom
         return per_label.sum() / denom
 
     @torch.no_grad()

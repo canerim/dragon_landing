@@ -321,6 +321,26 @@ def test_rank_transform_preserves_auc():
     assert np.isclose(roc_auc(y, s[:, 0]), roc_auc(y, rank_transform(s)[:, 0]), atol=1e-12)
 
 
+def test_rank_transform_uses_midranks_so_ties_do_not_move_the_auc():
+    """Ordinal ranking breaks ties in argsort order, which is not a monotone
+    function of the input -- a single model's AUC then changes under a
+    transform whose whole point is to leave it alone.  Exact ties are common
+    here: every failed study is written as 0.5 on every label."""
+    rng = np.random.default_rng(0)
+    y = (rng.random(400) < 0.3).astype(float)
+    s = np.round(rng.random((400, 3)), 1)  # ~10 distinct values, heavy ties
+    r = rank_transform(s)
+    assert r.shape == s.shape
+    for c in range(s.shape[1]):
+        assert np.isclose(roc_auc(y, s[:, c]), roc_auc(y, r[:, c]), atol=1e-12)
+
+    # Explicit midranks, and 1-D input is accepted too.
+    assert np.allclose(
+        rank_transform(np.array([3.0, 1.0, 1.0, 5.0])),
+        np.array([2.0, 0.5, 0.5, 3.0]) / 3.0,
+    )
+
+
 def test_label_weights_prefer_the_better_model_per_label():
     rng = np.random.default_rng(4)
     n, L = 1200, 12
@@ -518,3 +538,67 @@ def test_submission_rejects_nonfinite(tmp_path):
     with pytest.raises(SubmissionError, match="non-finite"):
         build_submission([f"u{i}" for i in range(10)], p,
                          output_path=tmp_path / "submission.csv", strict=True)
+
+
+def test_combine_members_matches_the_space_the_weights_were_fitted_in():
+    """`fit_label_weights` optimises over rank-transformed OOF predictions, so
+    deployment must combine ranks too -- and the AUC of the result must equal
+    the AUC of the rank combination exactly, despite the probability rescale."""
+    from kairos.ensemble.weights import combine_members, rank_transform
+
+    rng = np.random.default_rng(7)
+    N, L, M = 300, 4, 3
+    y = (rng.random((N, L)) < 0.3).astype(float)
+    # Members with deliberately different calibration: one squashed towards
+    # 0.5, one sharpened, one plain.  Probability averaging is dominated by the
+    # sharpened member; rank averaging is not.
+    base = [rng.normal(size=(N, L)) + 1.4 * y for _ in range(M)]
+    squash = [1.0, 6.0, 0.25]
+    preds = np.stack([1 / (1 + np.exp(-squash[m] * base[m])) for m in range(M)])
+
+    w = np.full((L, M), 1.0 / M)
+    out = combine_members(preds, w)
+    assert out.shape == (N, L)
+    assert np.isfinite(out).all()
+
+    ranks = np.stack([rank_transform(preds[m]) for m in range(M)])
+    ref = np.einsum("lm,mnl->nl", w, ranks)
+    assert np.allclose(combine_members(preds, w, rescale=False), ref, atol=1e-12)
+    for l in range(L):
+        # The probability rescale is a *monotone* map of the combined rank --
+        # that is the exact guarantee, and it is what makes the AUC of the
+        # rescaled output the AUC of the ranking.
+        order = np.argsort(ref[:, l], kind="mergesort")
+        assert np.all(np.diff(out[order, l]) >= 0)
+        assert np.isclose(roc_auc(y[:, l], out[:, l]),
+                          roc_auc(y[:, l], ref[:, l]), atol=1e-4)
+
+    # The rescale keeps the output on the members' probability scale rather
+    # than on [0, 1] ranks, so prevalence sanity checks still mean something.
+    assert abs(out.mean() - preds.mean()) < 0.05
+
+    # A per-label weight of 1 on one member reproduces that member's ranking.
+    w1 = np.zeros((L, M)); w1[:, 1] = 1.0
+    only1 = combine_members(preds, w1)
+    for l in range(L):
+        assert np.isclose(roc_auc(y[:, l], only1[:, l]),
+                          roc_auc(y[:, l], preds[1][:, l]), atol=1e-9)
+
+
+def test_combine_members_survives_the_failed_study_fallback():
+    """Failed studies are written as 0.5 on every label; the resulting mass of
+    exact ties must not create ties in the combined ranking."""
+    from kairos.ensemble.weights import combine_members
+
+    rng = np.random.default_rng(8)
+    N, L, M = 120, 3, 2
+    preds = rng.random((M, N, L))
+    preds[:, :30, :] = 0.5          # 30 "failed" studies
+    preds[0, 40, 0] = np.nan        # and one NaN that must be repaired
+    out = combine_members(preds)
+    assert np.isfinite(out).all()
+    for l in range(L):
+        # Strictly increasing rescale => no new ties beyond the ones the ranks
+        # themselves produce.
+        assert len(np.unique(out[:, l])) >= len(np.unique(np.round(out[:, l], 9)))
+    assert combine_members(preds[:, :1, :]).shape == (1, L)

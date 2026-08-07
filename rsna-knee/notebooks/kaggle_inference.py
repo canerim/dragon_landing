@@ -29,6 +29,7 @@ Design rules, all of which exist because of a specific way submissions fail:
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import os
 import sys
@@ -55,7 +56,16 @@ CODE_DIRS = ["/kaggle/input/kairos-code/src", "/kaggle/working/rsna-knee/src"]
 TIME_BUDGET_S = float(os.environ.get("KAIROS_BUDGET_S", 9 * 3600))
 RESERVE_FRAC = 0.12
 FLUSH_EVERY = 200
-MAX_TTA = 2
+# Forward passes per model per study, TTA included.  Default 1 = no TTA.
+#
+# This used to be 2, but the view was constructed in a way that raised on every
+# study and was swallowed, so TTA never actually ran and the budget was never
+# actually spent.  Now that it works, the honest default is off: a second pass
+# doubles inference cost, and under a hard 9-hour budget the governor pays for
+# it by throttling the *fine pass* -- trading a measured coarse-to-fine gain for
+# an unmeasured augmentation-averaging one.  Raise it only with an OOF number
+# that says the trade is worth it.
+MAX_TTA = int(os.environ.get("KAIROS_MAX_TTA", 1))
 DEBUG = os.environ.get("KAIROS_DEBUG") == "1"
 
 T0 = time.monotonic()
@@ -233,9 +243,63 @@ governor = RuntimeGovernor(
     start_escalation=0.35,
 )
 
-predictions = np.full((N_STUDIES, NUM_TARGETS), np.nan)
+# (M, N, L): every member's own prediction, kept separately until the end.
+#
+# The members are combined in *rank* space, and that cannot be done one study
+# at a time -- a rank needs the whole column.  It is also the only combination
+# that matches how ``WEIGHTS`` was fitted: ``fit_label_weights`` optimises a
+# per-label simplex over rank-transformed OOF predictions, so applying those
+# same weights to raw probabilities at test time optimises one objective and
+# deploys another.  Since the metric is macro-AUC, which sees only the ordering,
+# rank averaging is also the correct combiner regardless of how differently the
+# members happen to be calibrated.  Memory is negligible: 5 members x 10k
+# studies x 12 labels is under 5 MB.
+member_preds = np.full((max(len(MODELS), 1), N_STUDIES, NUM_TARGETS), np.nan)
 shard_dir = Path("/kaggle/working/shards")
 shard_dir.mkdir(exist_ok=True, parents=True)
+
+
+# --------------------------------------------------------------------------- #
+# Test-time augmentation views: (pixel transform, output permutation or None)   #
+# --------------------------------------------------------------------------- #
+#
+# The left-right mirror that used to sit here was wrong twice over.  A mirrored
+# knee swaps medial and lateral, so averaging the mirrored logits into the
+# originals without permuting them corrupts ``Medial Meniscus``, ``Lateral
+# Meniscus``, ``Medial OA`` and ``Lateral OA`` -- the exact corruption
+# ``MEDIAL_LATERAL_SWAP`` exists to prevent during training.  And even with the
+# permutation it would be out of distribution: laterality is canonicalised in
+# the loader and ``AugmentConfig.horizontal_flip_prob`` is 0, so the network
+# has never seen a mirrored knee.
+#
+# What is left is an intensity view, which *is* inside the training
+# distribution (the augmenter applies gamma over the same range) and is
+# label-preserving, so it needs no permutation.  The flip stays available,
+# correctly permuted, for weights trained with flips enabled.
+TTA_FLIP = os.environ.get("KAIROS_TTA_FLIP") == "1"
+
+
+def _gamma_view(x, g: float = 1.12):
+    lo = x.amin()
+    rng = (x.amax() - lo).clamp_min(1e-6)
+    return ((x - lo) / rng).clamp(0, 1).pow(g) * rng + lo
+
+
+#: Counted, not silently swallowed: a TTA that never runs looks exactly like a
+#: TTA that runs and does not help.
+_TTA_FAILURES = 0
+
+TTA_VIEWS = [(_gamma_view, None)]
+if TTA_FLIP:
+    from kairos.data.transforms import MEDIAL_LATERAL_SWAP  # noqa: E402
+
+    # The swap is an involution, so the same permutation maps the mirrored
+    # model's outputs back onto the original anatomy.
+    TTA_VIEWS.append((lambda x: x.flip(-1), list(MEDIAL_LATERAL_SWAP)))
+
+n_views = 1 + len(TTA_VIEWS[: max(MAX_TTA - 1, 0)])
+log(f"TTA: {n_views} view(s) per model per study"
+    + (" (mirror enabled)" if TTA_FLIP else ""))
 
 
 def load_study(uid: str):
@@ -251,6 +315,7 @@ def load_study(uid: str):
 
 
 def predict_one(batch, escalation: float) -> np.ndarray:
+    """Return ``(M, L)`` -- one probability vector per ensemble member."""
     import torch
 
     outs = []
@@ -261,17 +326,27 @@ def predict_one(batch, escalation: float) -> np.ndarray:
                 model.cfg.fine_budget_fraction = float(escalation)
             o = model(batch, run_fine=run_fine, update_precision=False)
             p = torch.sigmoid(o["logits"]).float().cpu().numpy()
-            if MAX_TTA >= 2:
-                flipped = batch
+            n_tta = 1
+            for tf, perm in TTA_VIEWS[: max(MAX_TTA - 1, 0)]:
                 try:
-                    flipped = batch.__class__(**{**batch.__dict__, "pixels": batch.pixels.flip(-1)})
-                    o2 = model(flipped, run_fine=False, update_precision=False)
-                    p = 0.5 * (p + torch.sigmoid(o2["logits"]).float().cpu().numpy())
-                except Exception:
-                    pass
-            outs.append(p)
-    stacked = np.stack(outs)  # (M, B, L)
-    return np.einsum("lm,mbl->bl", WEIGHTS, stacked)
+                    # ``dataclasses.replace``, not ``batch.__class__(**__dict__)``:
+                    # StudyBatch is ``@dataclass(slots=True)`` and therefore has
+                    # no ``__dict__`` at all.  The old expression raised
+                    # AttributeError on the first study and was swallowed by
+                    # this very ``except``, so TTA had been a silent no-op --
+                    # costing nothing, gaining nothing, and looking enabled.
+                    view = dataclasses.replace(batch, pixels=tf(batch.pixels))
+                    o2 = model(view, run_fine=False, update_precision=False)
+                    q = torch.sigmoid(o2["logits"]).float().cpu().numpy()
+                    p = p + (q[:, perm] if perm is not None else q)
+                    n_tta += 1
+                except Exception as exc:  # noqa: BLE001 - never lose a study
+                    global _TTA_FAILURES
+                    _TTA_FAILURES += 1
+                    if _TTA_FAILURES == 1:
+                        log(f"TTA disabled after a failure: {type(exc).__name__}: {exc}")
+            outs.append(p / n_tta)
+    return np.stack(outs)[:, 0, :]  # (M, L); batch size is 1 here
 
 
 n_failed = 0
@@ -280,23 +355,33 @@ for i, uid in enumerate(STUDY_UIDS):
     esc = governor.start_study()
     try:
         batch = load_study(uid)
-        predictions[i] = predict_one(batch, esc)[0]
+        member_preds[:, i, :] = predict_one(batch, esc)
     except Exception as exc:
         n_failed += 1
         if n_failed <= 5:
             log(f"study {uid} failed ({type(exc).__name__}: {exc}); using 0.5")
-        predictions[i] = 0.5
+        member_preds[:, i, :] = 0.5
     finally:
         governor.end_study(time.monotonic() - t_start)
 
     if (i + 1) % FLUSH_EVERY == 0:
-        np.save(shard_dir / f"shard_{i // FLUSH_EVERY:04d}.npy", predictions)
+        np.save(shard_dir / f"shard_{i // FLUSH_EVERY:04d}.npy", member_preds)
         log(governor.report())
     if governor.should_abort_fine() and esc > 0.02:
         log("budget pressure: dropping to coarse-only for the remainder")
 
 log(f"inference done: {n_failed} study failure(s) out of {N_STUDIES}")
 log(governor.report())
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3b — combine the members in rank space                                 #
+# --------------------------------------------------------------------------- #
+
+from kairos.ensemble.weights import combine_members  # noqa: E402
+
+predictions = combine_members(member_preds, WEIGHTS)
+log(f"combined {len(MODELS)} member(s) in rank space")
 
 
 # --------------------------------------------------------------------------- #
