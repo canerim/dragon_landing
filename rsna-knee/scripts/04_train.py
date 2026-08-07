@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 from kairos.constants import NUM_TARGETS, TARGETS
+from kairos.data.folds import resolve_environments
 from kairos.data.loader import SamplerConfig, StudyDataset, build_dataloader, infer_prevalence
 from kairos.data.transforms import AugmentConfig
 from kairos.eval.metrics import per_label_auc
@@ -76,40 +77,9 @@ def package_versions() -> dict:
 # --------------------------------------------------------------------------- #
 
 
-#: Columns that can stand in for "acquisition environment", best first.
-#: ``site`` is not a DICOM tag and the organisers do not ship one, so the
-#: honest proxy is the scanner: ``scripts/00_build_manifest.py`` writes
-#: ``scanner_proxy`` = manufacturer/field-strength for exactly this purpose.
-#: Looking only for ``site`` -- which is what this script used to do -- meant
-#: every study landed in environment 0, and Group-DRO with one group is the
-#: mean, while IRM with one environment is identically zero.  Both terms then
-#: cost their compute, logged a plausible number, and changed nothing.
-ENV_COLUMNS = ("site", "scanner_proxy", "manufacturer", "field_strength_bucket")
-
-
-def _resolve_environments(df, n: int):
-    """Return ``(env_index_per_study, column_used)``."""
-    import pandas as pd
-
-    for col in ENV_COLUMNS:
-        if col not in df.columns:
-            continue
-        codes = pd.factorize(df[col].astype(str))[0]
-        if codes.max() >= 1:  # at least two distinct environments
-            print(f"environments: {codes.max() + 1} distinct values of '{col}'")
-            return codes.astype(int), col
-    print(
-        "!! no usable environment column (looked for "
-        + ", ".join(ENV_COLUMNS)
-        + "); group_dro and irm will be disabled",
-        file=sys.stderr,
-    )
-    return np.zeros(n, dtype=int), None
-
-
 #: The two producers do not agree on a column convention and should not have
 #: to: ``02_parse_reports.py`` writes ``weak_<target>`` / ``conf_<target>``
-#: (because the same table also carries ``state_<target>``), while
+#: (the same table also carries ``state_<target>``), while
 #: ``07_make_teacher.py`` writes bare target names.  Resolving prefixes here,
 #: once, is much safer than making either producer guess what the consumer
 #: wants -- a silent mismatch would leave the term looking present and reading
@@ -301,7 +271,7 @@ def main() -> int:
         gcol = next((c for c in ("PatientID", "patient_id", "group_id") if c in df), None)
         groups = df[gcol].astype(str).tolist() if gcol else uids
         fold_of = df["fold"].to_numpy()
-        sites, site_col = _resolve_environments(df, len(uids))
+        sites, site_col = resolve_environments(df)
 
         from kairos.data.dataset import load_study
         from kairos.io.layout import discover

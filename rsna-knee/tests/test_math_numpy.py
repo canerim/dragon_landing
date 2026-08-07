@@ -602,3 +602,32 @@ def test_combine_members_survives_the_failed_study_fallback():
         # themselves produce.
         assert len(np.unique(out[:, l])) >= len(np.unique(np.round(out[:, l], 9)))
     assert combine_members(preds[:, :1, :]).shape == (1, L)
+
+
+def test_resolve_environments_skips_a_column_with_one_value():
+    """A single-valued column is not an environment split.  Accepting it puts
+    every study in environment 0, where Group-DRO is the mean and IRM is
+    identically zero -- both cost their compute and change nothing."""
+    pd = pytest.importorskip("pandas")
+    from kairos.data.folds import ENV_COLUMNS, resolve_environments
+
+    # `site` is first in the preference order but does not exist here; the
+    # scanner proxy the manifest actually writes is what should be picked.
+    df = pd.DataFrame({
+        "manufacturer": ["GE", "GE", "GE"],           # single-valued: skipped
+        "scanner_proxy": ["GE/3.0", "Siemens/1.5", "GE/3.0"],
+    })
+    codes, col = resolve_environments(df, verbose=False)
+    assert col == "scanner_proxy"
+    assert codes.tolist() == [0, 1, 0]
+
+    codes, col = resolve_environments(
+        pd.DataFrame({"manufacturer": ["GE", "GE"]}), verbose=False
+    )
+    assert col is None and codes.tolist() == [0, 0]
+
+    # And an explicit `site` column wins when it is informative.
+    df["site"] = ["a", "b", "c"]
+    codes, col = resolve_environments(df, verbose=False)
+    assert col == "site" and sorted(codes.tolist()) == [0, 1, 2]
+    assert ENV_COLUMNS[0] == "site"

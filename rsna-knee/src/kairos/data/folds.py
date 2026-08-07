@@ -57,9 +57,49 @@ __all__ = [
     "make_folds",
     "fold_report",
     "assignment_hash",
+    "ENV_COLUMNS",
+    "resolve_environments",
 ]
 
 _EPS = 1e-9
+
+
+#: Columns that can stand in for "acquisition environment", best first.
+#:
+#: ``site`` is not a DICOM tag and the organisers do not ship one, so the honest
+#: proxy is the scanner: ``scripts/00_build_manifest.py`` writes
+#: ``scanner_proxy`` = manufacturer/field-strength for exactly this purpose.
+#: Two scripts looked only for ``site``.  Every study then landed in environment
+#: 0 -- Group-DRO over one group is the mean, IRM over one environment is
+#: identically zero, and the per-site prediction-gap audit silently abstains.
+#: The resolution lives here so ``04_train.py`` and ``05_oof_eval.py`` cannot
+#: disagree about what an environment is.
+ENV_COLUMNS: tuple[str, ...] = (
+    "site", "scanner_proxy", "manufacturer", "field_strength_bucket",
+)
+
+
+def resolve_environments(df, *, columns: Sequence[str] = ENV_COLUMNS, verbose: bool = True):
+    """Return ``(integer environment per row, column used or None)``.
+
+    A column with a single distinct value is *not* an environment split, so it
+    is skipped rather than accepted -- that distinction is the whole point.
+    """
+    import pandas as pd
+
+    n = len(df)
+    for col in columns:
+        if col not in getattr(df, "columns", ()):
+            continue
+        codes = pd.factorize(df[col].astype(str))[0]
+        if codes.max() >= 1:
+            if verbose:
+                print(f"environments: {codes.max() + 1} distinct values of {col!r}")
+            return codes.astype(int), col
+    if verbose:
+        print("!! no usable environment column (looked for "
+              + ", ".join(columns) + ")")
+    return np.zeros(n, dtype=int), None
 
 
 @dataclass(slots=True)

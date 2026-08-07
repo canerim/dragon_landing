@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from kairos.constants import TARGETS
+from kairos.data.folds import resolve_environments
 from kairos.eval.leakage import run_audit_suite
 from kairos.eval.metrics import delong_test, evaluate
 
@@ -59,7 +60,11 @@ def main() -> int:
     fold = rows["fold"].to_numpy()
     group_col = next((c for c in ("PatientID", "patient_id", "group_id") if c in rows), None)
     group = rows[group_col].astype(str).to_numpy() if group_col else np.array(uids)
-    site = rows["site"].to_numpy() if "site" in rows else None
+    # Same resolution the trainer uses.  Looking only for a bare "site" column
+    # -- which nothing in the pipeline writes -- left `site` as None, so the
+    # per-site prediction-gap audit silently abstained on every real run.
+    site_codes, site_col = resolve_environments(rows)
+    site = site_codes if site_col is not None else None
 
     scores = 1.0 / (1.0 + np.exp(-logits))
 
