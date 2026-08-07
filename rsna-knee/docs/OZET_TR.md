@@ -130,6 +130,29 @@ adımda `None` döndürüyordu.
 
 ---
 
+### 2.4 Çapraz-eğitilmiş (cross-fitted) öğretmen
+
+S4'ün damıttığı öğretmeni `scripts/07_make_teacher.py` üretir. Her `oof.npz`,
+fold-*k* koşusunun **kendi validasyon fold'undaki** tahminlerini taşır — yani o
+koşunun hiç eğitilmediği çalışmaları. Fold'ları birleştirince her çalışma için
+onu görmemiş bir modelden tahmin elde edilir. Bu özellik olmadan öğretmenin bir
+eğitim çalışmasındaki logiti kısmen ezberlenmiş etikettir ve öğrenci de ezberi
+öğrenir. Ortalama **olasılık** uzayında alınır: rank olasılık değildir ve
+damıtma hedefi olasılık olmak zorundadır — bu, boru hattında §6.3'ün rank
+ortalamasının yanlış cevap olduğu tek yerdir.
+
+Kalan sızıntı, üstünü örtmeden: fold *k* öğrencisi *k* dışındaki fold'larda
+eğitilir; fold *m*'deki bir çalışmanın öğretmen logiti *m*'de doğrulanan
+koşudan gelir — o koşu ise *m* dışındaki fold'larda, yani fold *k* **dahil**,
+eğitilmiştir. Bunu tamamen yok etmek "leave-two-out" öğretmenler gerektirir
+(5 yerine 20 koşu) ve bu bedeli ödemiyoruz. Somut sonucu şudur: KD ile eğitilen
+bir öğrencinin fold-*k* OOF'u, KD'siz bir öğrenciye kıyasla hafifçe iyimserdir.
+Bu yüzden ikisini doğrudan karşılaştırın; KD'li bir öğrencinin OOF'unu dışarıda
+yayınlanmış bir sayıyla asla karşılaştırmayın.
+
+Öğretmeni olmayan çalışmalar NaN gelir ve terimden **düşürülür**, doldurulmaz:
+0 logit "her etikette p = 0.5" demektir — nötr değil, mevcut en kötü hedeftir.
+
 ## 3. Çok dilli rapor ayrıştırma: üç tuzak
 
 RadGraph / CheXbert / NegBio hem İngilizce hem göğüs-özgüdür. **Yöntemi** taşıyın,
@@ -326,26 +349,32 @@ olmadan mimariye harcanan her saat, güvenemeyeceğiniz bir sayıya harcanmışt
 
 ```bash
 pip install -e ".[train,dev]"
-pytest -q                          # 196 test
+pytest -q                          # 249 test
 python scripts/99_smoke_test.py    # 10 aşamalı uçtan uca koşu, ~20 sn, sadece CPU
 
-# tüm eğitim yolunun kuru koşusu: veri yok, GPU yok, ~1 dk
+# tüm eğitim yolunun kuru koşusu: veri yok, GPU yok, ~1 dk.
+# --disable gerekmiyor: besleyemediği terimleri kendisi kapatıp söylüyor.
 python scripts/04_train.py --synthetic --budget small --epochs-cap 2 \
-    --no-pretrained --device cpu --disable kd,ot_ground,weak_label
+    --no-pretrained --device cpu
 ```
 
 Sıra: `00_build_manifest` → `01_make_folds` → `02_parse_reports --audit` →
-`04_train` → `05_oof_eval` → `06_ensemble`. Hepsinden önce
+`04_train` (×5 fold) → `05_oof_eval` → `06_ensemble` → `07_make_teacher` →
+`04_train --teacher ...` (S4'ün KD'si artık canlı). Hepsinden önce
 `notebooks/kaggle_baseline.py`'ı Kaggle'a at — ağırlık gerektirmiyor, ~0.5 alıyor,
 ve karşılığında veri düzenini, DICOM tag sayımını ve I/O'nun 9 saatin ne kadarını
 yediğini söylüyor.
 
-**Bir güvenlik özelliği:** curriculum hesaplanamayacak bir terim planlarsa
-(`kd` var ama teacher logit yok gibi) eğitim **başlamıyor**, eksik alanı
-söyleyerek duruyor. Sessizce atlamak, daha küçük bir hedefi optimize edip loss
-eğrisini sağlıklı gösterirdi — ve tek belirti, üç GPU-günü sonra ablasyonla
-çelişen bir OOF skoru olurdu. Bilerek kapattığın terimleri `--disable` ile
-adlandırman gerekiyor ve run manifest'ine yazılıyorlar.
+**Bir güvenlik özelliği:** bir terim ya beslenir ya da kapatıldığı **yazılır**;
+sessizce atlanmaz. `04_train.py` bu çağrının gerçekten sağlayabildiklerini
+çözer (Group-DRO ve IRM için bir akuizisyon ortamı, KD için öğretmen, weak
+label, metin ve phrase embedding), kalanını yüksek sesle kapatır ve isimlerini
+run manifest'ine yazar. `validate_schedule` ondan sonra hâlâ planlı ama
+hesaplanamayan bir şey varsa eğitimi **başlatmaz** — batch alanlarının yanı sıra
+model **çıktılarını** da kontrol ederek, çünkü `shortcut`'ın bir aşama boyunca
+atıl çalışmasına izin veren kör nokta çıktı tarafındaydı. Sessizce atlamak, daha
+küçük bir hedefi optimize edip loss eğrisini sağlıklı gösterirdi — tek belirti,
+üç GPU-günü sonra ablasyonla çelişen bir OOF skoru olurdu.
 
 Smoke test gerçek kod yolunu sürüyor — fold → collation → curriculum altında model
 ileri/geri → OOF değerlendirme → denetim paketi → ensembling → kalibrasyon →
@@ -353,10 +382,24 @@ conformal → submission. Stub yok.
 
 ---
 
-## 11. Testlerin yakaladığı dört gerçek hata
+## 11. Testlerin ve denetimin yakaladığı gerçek hatalar
 
-Geliştirme sırasında testler dört gerçek hata buldu; her biri düzeltildiği yerde
-kodda belgeli:
+Geliştirme sırasında testler ve çalışan ağaç üzerinde yürütülen düşmanca bir
+denetim gerçek hatalar buldu; her biri düzeltildiği yerde kodda belgeli. Tam
+liste `README.md`'de; en pahalı üçü:
+
+* **Cihaz taşımasında kaybolan etiket.** `_auc_ascent` / `_minimax`
+  `nn.Parameter` üzerinde düz Python attribute'uydu; `nn.Module._apply` cihaz
+  değişiminde her Parameter'ı yeniden kuruyor ve bunları düşürüyor. CPU'da
+  hayatta kalıyorlardı — bütün testler geçiyordu — GPU'da ise min-max bloğu
+  sessizce AdamW'ye dönüyor, α konkav bir objektifte descent'e giriyor ve A3
+  margin terimi tamamen sıfırlanıyordu.
+* **Aligned-MTL kurulup hiç çağrılmıyordu.**
+* **TTA hiç çalışmamıştı**: görünüm `batch.__class__(**batch.__dict__)` ile
+  kuruluyordu, `StudyBatch` ise `slots=True` — `__dict__` yok. İlk çalışmada
+  exception atıp `except: pass` tarafından yutuluyordu.
+
+Daha eski, testlerin bulduğu dört tanesi:
 
 | # | Hata | Neden önemliydi |
 |---|------|-----------------|

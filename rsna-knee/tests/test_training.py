@@ -908,3 +908,91 @@ def test_trainer_routes_the_minimax_block_after_a_device_move():
     assert not (minimax & {id(p) for g in t.opt.param_groups for p in g["params"]})
     assert t.pesg._is_ascent(aucm.alpha)
     assert not t.pesg._is_ascent(aucm.a)
+
+
+# --------------------------------------------------------------------------- #
+# Auxiliary supervision: weak labels and the cross-fitted teacher              #
+# --------------------------------------------------------------------------- #
+
+
+def test_dataset_carries_weak_labels_and_teacher_logits():
+    """Without this plumbing `weak_label` and `kd` are registered, scheduled,
+    and permanently uncomputable -- every run had to `--disable` them."""
+    rng = np.random.default_rng(41)
+    labels = (rng.random((4, NUM_TARGETS)) < 0.4).astype(np.float32)
+    weak = rng.random((4, NUM_TARGETS)).astype(np.float32)
+    weak[0, 3] = float("nan")  # the report did not mention that finding
+    conf = np.full((4, NUM_TARGETS), 0.9, dtype=np.float32)
+    teacher = rng.normal(size=(4, NUM_TARGETS)).astype(np.float32)
+    teacher[2] = float("nan")  # this study has no teacher
+
+    ds = StudyDataset(
+        [f"s{i}" for i in range(4)],
+        load_fn=lambda uid: _record(int(uid[1:]), labels),
+        labels=labels, weak_labels=weak, weak_confidence=conf,
+        teacher_logits=teacher,
+    )
+    batch = collate_studies([ds[i] for i in range(4)], device="cpu")
+    assert batch.weak_labels is not None and batch.weak_confidence is not None
+    assert batch.teacher_logits is not None
+    assert torch.isnan(batch.weak_labels[0, 3])
+    assert torch.isnan(batch.teacher_logits[2]).all()
+    assert torch.isfinite(batch.teacher_logits[[0, 1, 3]]).all()
+
+
+def test_kd_drops_studies_with_no_teacher_instead_of_distilling_to_half():
+    """A teacher logit of 0 is a confident 'p = 0.5 on every label', which is
+    the worst possible target -- the rows must be dropped, not filled."""
+    rng = np.random.default_rng(42)
+    labels = (rng.random((4, NUM_TARGETS)) < 0.4).astype(np.float32)
+    recs = [_record(i, labels) for i in range(4)]
+    teacher = rng.normal(size=(4, NUM_TARGETS)).astype(np.float32)
+    for r, t in zip(recs, teacher):
+        r.teacher_logits = t.copy()
+    model = _tiny_model()
+    reg = build_objectives(ObjectiveConfig(prevalence=[0.4] * NUM_TARGETS), model=model)
+    state = {"step": 0, "epoch": 0, "weights": {}}
+
+    full = collate_studies(recs, device="cpu")
+    out = model(full, update_precision=True)
+    with_all = reg["kd"](out, full, state)
+    assert with_all is not None and torch.isfinite(with_all)
+
+    # Blank two teachers; the value must equal KD over the remaining two.
+    for r in recs[:2]:
+        r.teacher_logits = np.full(NUM_TARGETS, np.nan, dtype=np.float32)
+    partial = collate_studies(recs, device="cpu")
+    got = reg["kd"](out, partial, state)
+    assert got is not None and torch.isfinite(got)
+
+    sub = collate_studies(recs[2:], device="cpu")
+    ref = reg["kd"]({"logits": out["logits"][2:]}, sub, state)
+    assert torch.allclose(got, ref, atol=1e-5)
+
+    # No teacher at all -> the term is skipped, not fed a matrix of NaNs.
+    for r in recs:
+        r.teacher_logits = np.full(NUM_TARGETS, np.nan, dtype=np.float32)
+    none_batch = collate_studies(recs, device="cpu")
+    assert none_batch.teacher_logits is None
+    assert reg["kd"](out, none_batch, state) is None
+
+
+def test_mirror_permutes_every_per_label_vector_not_just_the_gold_labels():
+    """A flip swaps medial and lateral.  A weak label or teacher logit left
+    unpermuted would supervise mirrored pixels with the unmirrored side."""
+    rng = np.random.default_rng(43)
+    labels = (rng.random((1, NUM_TARGETS)) < 0.4).astype(np.float32)
+    weak = np.arange(NUM_TARGETS, dtype=np.float32)[None, :]
+    teacher = -np.arange(NUM_TARGETS, dtype=np.float32)[None, :]
+
+    ds = StudyDataset(
+        ["s0"], load_fn=lambda uid: _record(0, labels), labels=labels,
+        weak_labels=weak, teacher_logits=teacher,
+        augment=AugmentConfig(horizontal_flip_prob=1.0, p_geometric=0.0,
+                              p_intensity=0.0, slice_dropout=0.0, seed=0),
+    )
+    rec = ds[0]
+    swap = list(MEDIAL_LATERAL_SWAP)
+    assert np.allclose(rec.weak_labels, weak[0][swap])
+    assert np.allclose(rec.teacher_logits, teacher[0][swap])
+    assert np.allclose(rec.labels, labels[0][swap])

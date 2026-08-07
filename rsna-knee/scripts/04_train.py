@@ -107,6 +107,77 @@ def _resolve_environments(df, n: int):
     return np.zeros(n, dtype=int), None
 
 
+#: The two producers do not agree on a column convention and should not have
+#: to: ``02_parse_reports.py`` writes ``weak_<target>`` / ``conf_<target>``
+#: (because the same table also carries ``state_<target>``), while
+#: ``07_make_teacher.py`` writes bare target names.  Resolving prefixes here,
+#: once, is much safer than making either producer guess what the consumer
+#: wants -- a silent mismatch would leave the term looking present and reading
+#: nothing.
+_VALUE_PREFIXES = ("", "weak_", "teacher_")
+_CONF_PREFIXES = ("conf_", "confidence_")
+
+
+def _pick_columns(df, prefixes, suffix: str = ""):
+    for pre in prefixes:
+        cols = [f"{pre}{t}{suffix}" for t in TARGETS]
+        if all(c in df.columns for c in cols):
+            return cols
+    return None
+
+
+def _load_per_study(path, uids, what: str, *, want_confidence: bool = False):
+    """Align a per-study, per-label table to ``uids``.
+
+    Returns ``(values, confidence)``; missing studies are NaN, which is the
+    "unobserved" convention every masked loss in this codebase already honours.
+    Alignment is by ``StudyInstanceUID`` and never by row order -- a positional
+    join between two artefacts built at different times is the single most
+    destructive silent bug in a pipeline like this, and it is invisible in every
+    metric until the private leaderboard.
+    """
+    if path is None:
+        return None, None
+    import pandas as pd
+
+    df = pd.read_parquet(path) if str(path).endswith(".parquet") else pd.read_csv(path)
+    uid_col = next((c for c in df.columns if "study" in c.lower()), df.columns[0])
+    value_cols = _pick_columns(df, _VALUE_PREFIXES)
+    if value_cols is None:
+        raise SystemExit(
+            f"{path}: {what} table has no complete set of target columns. "
+            f"Looked for prefixes {_VALUE_PREFIXES} over {len(TARGETS)} targets; "
+            f"found {list(df.columns)[:8]}..."
+        )
+
+    df[uid_col] = df[uid_col].astype(str)
+    df = df.drop_duplicates(subset=[uid_col], keep="first").set_index(uid_col)
+    values = df.reindex(list(uids))[value_cols].to_numpy(dtype=np.float32)
+    covered = int(np.isfinite(values).any(axis=1).sum())
+    print(f"{what}: {covered}/{len(uids)} studies covered ({path})")
+    if covered == 0:
+        raise SystemExit(
+            f"{path}: no study UID matched the cohort. Check that this artefact "
+            "was built from the same manifest."
+        )
+
+    conf = None
+    if want_confidence:
+        conf_cols = _pick_columns(df, _CONF_PREFIXES) or _pick_columns(
+            df, ("",), suffix="_confidence"
+        )
+        if conf_cols is not None:
+            conf = df.reindex(list(uids))[conf_cols].to_numpy(dtype=np.float32)
+        else:
+            # No per-label confidence shipped: treat an extracted label as
+            # fully confident where it exists and absent where it does not.
+            # The weak-label term gates on confidence, so 0 is the correct
+            # value for a missing entry -- not 1.
+            conf = np.where(np.isfinite(values), 1.0, 0.0).astype(np.float32)
+        conf = np.nan_to_num(conf, nan=0.0)
+    return values, conf
+
+
 def synthetic_cohort(n_studies: int, size: int, seed: int):
     from kairos.constants import Plane
     from kairos.data.dataset import SeriesRecord, StudyRecord
@@ -181,6 +252,12 @@ def main() -> int:
 
     ap.add_argument("--disable", default="",
                     help="comma-separated objective terms to switch off deliberately")
+    ap.add_argument("--teacher", type=Path,
+                    help="teacher.parquet from 07_make_teacher.py; makes the "
+                         "S4 `kd` term computable")
+    ap.add_argument("--weak-labels", type=Path,
+                    help="weak_labels.parquet from 02_parse_reports.py; makes "
+                         "the S2 `weak_label` term computable")
     ap.add_argument("--eval-every", type=int, default=1)
     ap.add_argument("--epochs-cap", type=int, default=0,
                     help="stop after N epochs regardless of the plan (debugging)")
@@ -266,7 +343,12 @@ def main() -> int:
         f"{t}={p:.3f}" for t, p in zip(TARGETS, prevalence)))
 
     # -- data ------------------------------------------------------------- #
+    weak, weak_conf = _load_per_study(args.weak_labels, uids, "weak labels",
+                                      want_confidence=True)
+    teacher, _ = _load_per_study(args.teacher, uids, "teacher logits")
+
     def subset(idx, augment):
+        take = lambda a: None if a is None else a[idx]  # noqa: E731
         return StudyDataset(
             [uids[i] for i in idx],
             load_fn=load_fn,
@@ -274,6 +356,9 @@ def main() -> int:
             augment=augment,
             group_id=[groups[i] for i in idx],
             env_id=sites[idx],
+            weak_labels=take(weak),
+            weak_confidence=take(weak_conf),
+            teacher_logits=take(teacher),
         )
 
     train_ds = subset(train_idx, AugmentConfig(seed=args.seed))
@@ -320,11 +405,26 @@ def main() -> int:
     # -- schedule validation against a REAL batch ------------------------- #
     sample = next(iter(train_loader))
     disabled = {t.strip() for t in args.disable.split(",") if t.strip()}
+    # Terms whose inputs this invocation cannot supply are disabled *here*,
+    # loudly, and recorded in the run manifest -- rather than left to trip the
+    # schedule validator with an error the user then silences by hand.  The
+    # distinction that matters is between "omitted on purpose, written down"
+    # and "omitted silently"; this keeps the first and never allows the second.
     if site_col is None or int(sites.max()) == 0:
-        # Recorded in the run manifest rather than left to run as a no-op, so a
-        # later comparison cannot read "we trained with DRO" off this run.
         disabled |= {"group_dro", "irm"}
         print("!! single acquisition environment: disabling group_dro and irm")
+    if teacher is None:
+        disabled.add("kd")
+        print("!! no --teacher: disabling kd "
+              "(build one with scripts/07_make_teacher.py)")
+    if weak is None:
+        disabled.add("weak_label")
+        print("!! no --weak-labels: disabling weak_label "
+              "(build one with scripts/02_parse_reports.py)")
+    if sample.text_embedding is None:
+        disabled.add("contrastive")
+    if sample.phrase_embedding is None:
+        disabled.add("ot_ground")
     tcfg = TrainConfig(
         fold=args.fold, seed=args.seed, backbone_lr=args.backbone_lr,
         head_lr=args.head_lr, accum_steps=args.accum, amp_dtype=args.amp,

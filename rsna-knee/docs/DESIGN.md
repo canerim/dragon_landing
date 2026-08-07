@@ -588,6 +588,33 @@ start a run that schedules a term the model cannot feed — which is how this
 particular gap was found: the term had been scheduled at weight 0.5 for the
 whole of S1 and had been returning `None` every step.
 
+### Cross-fitted distillation: what it buys and what it does not
+
+Stage S4 distils from the OOF ensemble, built by `scripts/07_make_teacher.py`.
+Each `oof.npz` holds a fold-*k* run's predictions on **its own validation
+fold** — studies that run never trained on — so concatenating the folds gives
+every study a prediction from a model that has not seen it. Without that
+property the teacher's logit for a training study is partly a memorised label
+and the student learns to memorise it too. Averaging is in **probability**
+space: ranks are not probabilities, and a distillation target must be one. This
+is the one place in the pipeline where the rank averaging of §6.3 is the wrong
+answer.
+
+The residual, stated rather than glossed: the student for fold *k* trains on
+folds $\neq k$, and the teacher logit for a study in fold *m* comes from the run
+that validated on *m* — a run that trained on folds $\neq m$, which *includes*
+fold *k*. The teacher's parameters therefore encode fold-*k* information and a
+trace can reach the student through the teacher's outputs on training studies.
+Eliminating it needs leave-two-out teachers (one run per ordered fold pair, 20
+runs instead of 5) and we do not pay that. The consequence is concrete: a
+KD-trained student's fold-*k* OOF is mildly optimistic relative to a no-KD
+student's, so compare the two directly and never compare a KD student's OOF to
+an externally published number.
+
+Studies with no teacher arrive as NaN and are **dropped** from the term, not
+filled: a teacher logit of 0 is a confident "p = 0.5 on every label", which is
+the worst available target rather than a neutral one.
+
 ### 4.4 Multilingual report parsing
 
 RadGraph, CheXbert and NegBio are English *and* chest-specific: their vocabulary

@@ -316,10 +316,24 @@ import pandas as pd  # noqa: E402
 
 from kairos.infer.submission import build_submission, validate_submission  # noqa: E402
 
+from kairos.ensemble.weights import combine_members, rank_transform  # noqa: E402
+
+# Write what the notebook would write, not a convenient stand-in.  The members
+# are combined through the *deployment* combiner, so this stage would catch a
+# drift between how the weights are fitted (rank space) and how they are
+# applied -- which is exactly the bug that used to live in the notebook.
+final = combine_members(members, ew.weights)
+ref = np.einsum("lm,mnl->nl", ew.weights,
+                np.stack([rank_transform(members[m]) for m in range(members.shape[0])]))
+assert abs(macro_auc(labels, final) - macro_auc(labels, ref)) < 1e-6, \
+    "the probability rescale must be monotone in the combined rank"
+step(f"       combined macro-AUC {macro_auc(labels, final):.5f} "
+     f"(uniform {macro_auc(labels, np.stack([rank_transform(members[m]) for m in range(members.shape[0])]).mean(0)):.5f})")
+
 with tempfile.TemporaryDirectory() as td:
     out = Path(td) / "submission.csv"
     sample = pd.DataFrame({"StudyInstanceUID": uids, **{t: 0.5 for t in TARGETS}})
-    df = build_submission(uids, scores, output_path=out, sample_submission=sample)
+    df = build_submission(uids, final, output_path=out, sample_submission=sample)
     info = validate_submission(out, expected_uids=uids)
     step(f"       {info['n_rows']} rows, sha256 {info['sha256'][:16]}")
     assert list(df.columns) == ["StudyInstanceUID", *TARGETS]

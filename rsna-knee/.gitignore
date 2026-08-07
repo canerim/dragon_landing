@@ -4,8 +4,12 @@ __pycache__/
 .pytest_cache/
 .venv*/
 runs/
-data/
 artifacts/
+# Local datasets only.  A bare `data/` also matched `src/kairos/data/`, so the
+# entire data package -- dataset, loader, folds, transforms, taxonomy -- was
+# silently untracked: a fresh clone could not even import kairos.  Anchor the
+# pattern to the repository root.
+/data/
 *.pt
 *.pth
 *.parquet

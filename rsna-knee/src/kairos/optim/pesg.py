@@ -479,6 +479,17 @@ class GradientSurgery:
         (:math:`G \mapsto cG` gives :math:`d \mapsto cd`) and, for orthogonal
         rows, exactly invariant to rescaling any non-minimal task -- which is
         the property that makes it the default here.
+
+        **On the magnitude.**  The :math:`\sigma_{\min}` prefactor makes
+        :math:`\lVert d\rVert` track the *weakest* task, so it is routinely much
+        smaller than :math:`\lVert\sum_l g_l\rVert` -- ``surgery/grad_norm_ratio``
+        around 0.07 on twelve knee labels is normal, not a bug.  We deliberately
+        do **not** renormalise back.  Surgery is applied to a sub-block while
+        the backbone keeps the plain summed gradient, which sounds like it would
+        unbalance their effective learning rates; it does not, because AdamW
+        divides each parameter by its own second-moment estimate, so a uniformly
+        rescaled gradient produces very nearly the same step.  What survives the
+        rescale -- and what we actually want -- is the *direction*.
         """
         # G: (L, P).  Work with the small Gram matrix instead of the full SVD.
         M = G @ G.T

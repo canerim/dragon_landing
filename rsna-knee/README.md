@@ -63,14 +63,26 @@ torch surface is lazily imported.
 ## Verify
 
 ```bash
-pytest -q                          # 212 tests
+pytest -q                          # 249 tests
 python scripts/99_smoke_test.py    # 10-stage end-to-end run, ~20 s, CPU only
+
+# and the whole training chain on generated studies: 5 folds, the cross-fitted
+# teacher, then a re-train with distillation live.  No data, no GPU.
+for f in 0 1 2 3 4; do
+  python scripts/04_train.py --synthetic --budget small --epochs-cap 1 \
+      --no-pretrained --device cpu --fold $f --out runs/dry_f$f
+done
+python scripts/07_make_teacher.py --oof runs/dry_f*/oof.npz --out runs/teacher.parquet
+python scripts/04_train.py --synthetic --budget small --epochs-cap 1 \
+    --no-pretrained --device cpu --fold 0 --teacher runs/teacher.parquet
 ```
 
 The smoke test drives the real code path — folds → collation → model
 forward/backward under the curriculum → OOF evaluation → audit suite →
-ensembling → calibration → conformal → submission — on synthetic data. No
-stubs.
+ensembling → calibration → conformal → submission — on synthetic data. It
+combines the ensemble members through the *same* `combine_members` the
+submission notebook calls, so a drift between how the weights are fitted and how
+they are applied fails there rather than on Kaggle. No stubs.
 
 ## Use
 
@@ -105,9 +117,11 @@ python scripts/02_parse_reports.py --reports data/train_reports.csv --audit --to
 python scripts/02_parse_reports.py --reports data/train_reports.csv \
     --labels data/train_labels.csv --evaluate --out artifacts/weak_labels.parquet
 
-# 4. train one fold
+# 4. train one fold.  Terms whose inputs this invocation cannot supply are
+#    disabled loudly and recorded in the run manifest -- never silently.
 python scripts/04_train.py --folds artifacts/folds/folds.parquet \
     --manifest artifacts/manifest.parquet --fold 0 --budget medium \
+    --weak-labels artifacts/weak_labels.parquet \
     --out runs/convnext_s_f0
 
 # 5. evaluate + audit.  Exits non-zero on a blocking leakage failure.
@@ -117,6 +131,15 @@ python scripts/05_oof_eval.py --oof runs/convnext_s_f0/oof.npz \
 # 6. ensemble.  Ships the uniform average unless the nested gain beats 1 SE.
 python scripts/06_ensemble.py --oof runs/*/oof.npz \
     --folds artifacts/folds/folds.parquet --out artifacts/ensemble
+
+# 7. the cross-fitted teacher S4 distils from.  Every study's teacher comes
+#    from a model that never trained on it; the guards refuse a mixed split.
+python scripts/07_make_teacher.py --oof runs/*/oof.npz \
+    --out artifacts/teacher.parquet
+
+# 4b. re-train with distillation live.  Compare against the fold's no-KD run,
+#     not against a published number -- see docs/DESIGN.md §4.3 for why.
+python scripts/04_train.py ... --teacher artifacts/teacher.parquet
 ```
 
 Before any of that, submit `notebooks/kaggle_baseline.py`: it needs no weights,
@@ -177,7 +200,9 @@ src/kairos/
   eval/
     metrics.py            DeLong (co)variance + paired test, patient-cluster bootstrap
     leakage.py            ten-audit shortcut suite, five of them blocking
-  ensemble/weights.py     anchored mirror descent + James–Stein shrinkage + nested LOFO
+  ensemble/weights.py     anchored mirror descent + James–Stein shrinkage + nested LOFO,
+                          and `combine_members`: the one combiner both the
+                          ensembling script and the notebook deploy
   calibrate/conformal.py  Newton temperature, beta, conformal risk control, Mondrian
   infer/                  runtime–AUC Pareto, closed-loop governor, submission writer
 ```
@@ -194,6 +219,15 @@ reconstruct.
 **The audit suite blocks.** Five audits exit the pipeline non-zero:
 `shuffled_label`, `shuffled_report`, `duplicate_hash`, `embedding_neighbour`,
 and the fold-hash check. An audit that only warns is an audit that gets ignored.
+
+**A term is either fed or written down as disabled — never silently skipped.**
+`04_train.py` resolves what this invocation can actually supply (an acquisition
+environment for Group-DRO and IRM, a teacher for KD, weak labels, text and
+phrase embeddings), disables the rest loudly, and records the names in the run
+manifest. `validate_schedule` then refuses to start if anything still scheduled
+cannot be computed — checking model *outputs* as well as batch fields, because
+the blind spot that let `shortcut` run inert for a whole stage was on the output
+side.
 
 **Per-label ensemble weights must earn their place.** `06_ensemble.py` reports
 the nested leave-one-fold-out comparison and ships the *uniform* average unless

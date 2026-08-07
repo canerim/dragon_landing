@@ -406,6 +406,15 @@ def build_objectives(
     def _kd(o, b, s):
         if not _has(b, "teacher_logits"):
             return None
+        # A cross-fitted teacher does not cover every study: a run can fail, and
+        # a cohort can grow between the teacher build and the student run.  Those
+        # rows arrive as NaN and must be *dropped*, not distilled towards --
+        # ``ReportDistillation`` has no mask, and a teacher logit of 0 is a
+        # confident "p = 0.5 on every label", which is the worst possible target.
+        keep = torch.isfinite(b.teacher_logits).all(dim=1)
+        n = int(keep.sum())
+        if n < 1:
+            return None
         # Attention KD is the component that transfers *where the teacher
         # looks*, and it is the most valuable one for the rare osseous labels.
         # Hard-coding student_attn=None disabled it even when the batch carried
@@ -414,10 +423,14 @@ def build_objectives(
         if st_attn is not None and st_attn.dim() == 4:
             B, Nseq, L, S = st_attn.shape
             st_attn = st_attn.permute(0, 2, 1, 3).reshape(B, L, Nseq * S)
+        t_attn = getattr(b, "teacher_attention", None)
+        if n < keep.shape[0]:
+            st_attn = None if st_attn is None else st_attn[keep]
+            t_attn = None if t_attn is None else t_attn[keep]
         return kd(
-            o["logits"], b.teacher_logits,
+            o["logits"][keep], b.teacher_logits[keep],
             student_attn=st_attn,
-            teacher_attn=getattr(b, "teacher_attention", None),
+            teacher_attn=t_attn,
         )["total"]
 
     reg("kd", _kd, module=kd, requires=("teacher_logits",))
