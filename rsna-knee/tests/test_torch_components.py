@@ -713,3 +713,44 @@ def test_sequence_dropout_never_empties_a_study():
     for _ in range(20):
         out = model._apply_modality_dropout(mask)
         assert bool(out.any(dim=1).all())
+
+
+# --------------------------------------------------------------------------- #
+# Backbone construction must never substitute an encoder silently.             #
+# --------------------------------------------------------------------------- #
+
+
+def test_unbuildable_backbone_raises_instead_of_falling_back():
+    """The bug this exists for cost a training run.
+
+    ``convnext_small.fb_in22k_ft1k`` is not a tag timm has ever published (it
+    is ``fb_in22k_ft_in1k``).  ``timm.create_model`` raised, a bare
+    ``except Exception`` swallowed it, and a randomly-initialised 4.2M
+    FallbackEncoder trained in its place -- while every log line still named
+    convnext_small, because the script printed the *requested* name.
+    """
+    import pytest
+
+    from kairos.models.backbones import BackboneSpec, build_backbone
+
+    spec = BackboneSpec(name="definitely_not_a_real_backbone_xyz",
+                        pretrained=False, allow_fallback=False)
+    with pytest.raises(RuntimeError, match="Refusing to substitute"):
+        build_backbone(spec)
+
+
+def test_fallback_is_permitted_only_when_asked_and_is_marked():
+    from kairos.models.backbones import BackboneSpec, build_backbone
+
+    spec = BackboneSpec(name="definitely_not_a_real_backbone_xyz",
+                        pretrained=False, allow_fallback=True)
+    bb = build_backbone(spec)
+    # ``is_timm`` is what the trainer reports, so it must tell the truth.
+    assert bb.is_timm is False
+
+
+def test_default_backbone_tag_is_shaped_like_a_real_timm_tag():
+    """A cheap guard on the typo class, without needing weights or a network."""
+    from kairos.models.backbones import BackboneSpec
+
+    assert BackboneSpec().name.endswith("ft_in1k")

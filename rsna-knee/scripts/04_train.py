@@ -201,7 +201,10 @@ def main() -> int:
     ap.add_argument("--budget", choices=("small", "medium", "large"), default="medium")
     ap.add_argument("--student", action="store_true", help="efficiency-track plan")
 
-    ap.add_argument("--backbone", default="convnext_small.fb_in22k_ft1k")
+    ap.add_argument("--backbone", default="convnext_small.fb_in22k_ft_in1k")
+    ap.add_argument("--allow-fallback-backbone", action="store_true",
+                    help="permit the random-init FallbackEncoder if the named "
+                         "backbone cannot be built (default: refuse and exit)")
     ap.add_argument("--no-pretrained", action="store_true")
     ap.add_argument("--dim", type=int, default=384)
     ap.add_argument("--aggregator", choices=("transformer", "ssm", "both"),
@@ -346,12 +349,21 @@ def main() -> int:
     # -- model ------------------------------------------------------------ #
     mcfg = KairosConfig(
         backbone=BackboneSpec(name=args.backbone, pretrained=not args.no_pretrained,
-                              in_chans=5),
+                              in_chans=5,
+                              allow_fallback=args.allow_fallback_backbone),
         dim=args.dim, aggregator=args.aggregator,
     )
-    model = KairosModel(mcfg).to(args.device)
+    try:
+        model = KairosModel(mcfg).to(args.device)
+    except RuntimeError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
     n_par = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"model: {args.backbone}, {n_par / 1e6:.1f}M trainable parameters")
+    # Report what was *built*, not what was requested.  Printing args.backbone
+    # is how a silently-substituted encoder stayed invisible: every log line
+    # named convnext_small while a 4.2M random-init CNN was training.
+    built = args.backbone if model.backbone.is_timm else "FallbackEncoder (RANDOM INIT)"
+    print(f"model: {built}, {n_par / 1e6:.1f}M trainable parameters")
 
     # Optimiser steps, not batches.  Trainer.step increments once per
     # *optimiser* step, so counting batches makes the curriculum advance

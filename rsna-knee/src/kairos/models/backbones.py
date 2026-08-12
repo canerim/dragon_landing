@@ -77,7 +77,9 @@ __all__ = [
 
 @dataclass(slots=True)
 class BackboneSpec:
-    name: str = "convnext_small.fb_in22k_ft1k"
+    #: ``fb_in22k_ft_in1k``, not ``fb_in22k_ft1k`` -- the latter is not a tag
+    #: timm has ever published, and it silently produced a random-init encoder.
+    name: str = "convnext_small.fb_in22k_ft_in1k"
     pretrained: bool = True
     in_chans: int = 5
     drop_path_rate: float = 0.1
@@ -85,6 +87,11 @@ class BackboneSpec:
     lora_rank: int = 0
     grad_checkpointing: bool = False
     out_indices: tuple[int, ...] | None = None
+    #: Permit the randomly-initialised :class:`FallbackEncoder` when the named
+    #: backbone cannot be built.  True keeps the unit tests and the smoke run
+    #: executable without timm; ``04_train.py`` sets it False, because a real
+    #: training run must never silently swap its encoder.
+    allow_fallback: bool = True
 
 
 def inflate_stem(weight: torch.Tensor, in_chans: int) -> torch.Tensor:
@@ -255,7 +262,18 @@ class BackboneWrapper(nn.Module):
 
 
 def build_backbone(spec: BackboneSpec) -> BackboneWrapper:
-    """Instantiate a backbone, adapting the stem and optionally adding LoRA."""
+    """Instantiate a backbone, adapting the stem and optionally adding LoRA.
+
+    On failure this falls back to :class:`FallbackEncoder` only when
+    ``spec.allow_fallback`` is set, and says so loudly either way.  It used to
+    fall back silently from a bare ``except Exception``, which meant a wrong
+    pretrained tag -- ``convnext_small.fb_in22k_ft1k`` does not exist in timm
+    1.0.x; the tag is ``fb_in22k_ft_in1k`` -- produced a randomly-initialised
+    4.2M-parameter CNN while every log line still named the backbone that had
+    been *requested*.  The failure was invisible until someone noticed the
+    parameter count was 13M instead of 60M, and a training run that reaches
+    the leaderboard on a random-init encoder costs a competition.
+    """
     try:
         import timm  # type: ignore
 
@@ -275,7 +293,25 @@ def build_backbone(spec: BackboneSpec) -> BackboneWrapper:
         if spec.lora_rank > 0:
             apply_lora(model, rank=spec.lora_rank)
         return BackboneWrapper(model, num_features, is_timm=True)
-    except Exception:  # timm missing, or no offline weights for this name
+    except Exception as exc:  # timm missing, bad tag, or no offline weights
+        detail = f"{type(exc).__name__}: {exc}"
+        if not spec.allow_fallback:
+            raise RuntimeError(
+                f"could not build backbone {spec.name!r} ({detail}).\n"
+                "Refusing to substitute the randomly-initialised FallbackEncoder: "
+                "training would run to completion and report healthy losses on an "
+                "encoder that has learned nothing.\n"
+                "Check the pretrained tag with `timm.list_pretrained('<name>*')`, "
+                "or pass allow_fallback=True / --allow-fallback-backbone if a "
+                "throwaway encoder is genuinely what you want."
+            ) from exc
+        import warnings
+
+        msg = (f"!! backbone {spec.name!r} could not be built ({detail}); "
+               "falling back to the randomly-initialised FallbackEncoder. "
+               "This is NOT a competitive backbone.")
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        print(msg, flush=True)
         model = FallbackEncoder(in_chans=spec.in_chans, drop_path_rate=spec.drop_path_rate)
         return BackboneWrapper(model, model.num_features, is_timm=False)
 
