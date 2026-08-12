@@ -202,6 +202,12 @@ def main() -> int:
     ap.add_argument("--student", action="store_true", help="efficiency-track plan")
 
     ap.add_argument("--backbone", default="convnext_small.fb_in22k_ft_in1k")
+    ap.add_argument("--grad-checkpointing", action="store_true",
+                    help="recompute backbone activations in the backward pass; "
+                         "roughly halves activation memory for ~30%% more time. "
+                         "The 2.5D path flattens (batch x series x slices) into "
+                         "one image batch, so activation memory is the binding "
+                         "constraint on a 16GB card, not parameter count.")
     ap.add_argument("--allow-fallback-backbone", action="store_true",
                     help="permit the random-init FallbackEncoder if the named "
                          "backbone cannot be built (default: refuse and exit)")
@@ -368,6 +374,7 @@ def main() -> int:
     mcfg = KairosConfig(
         backbone=BackboneSpec(name=args.backbone, pretrained=not args.no_pretrained,
                               in_chans=5,
+                              grad_checkpointing=args.grad_checkpointing,
                               allow_fallback=args.allow_fallback_backbone),
         dim=args.dim, aggregator=args.aggregator,
     )
