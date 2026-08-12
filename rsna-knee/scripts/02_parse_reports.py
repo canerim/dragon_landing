@@ -65,8 +65,22 @@ def detect_language(text: str) -> str:
         return "ko"
     if re.search(r"[一-鿿]", t):
         return "zh"
+    # Greek was 7.5 % of the RSNA-2026 corpus and fell entirely into "unknown",
+    # so its reports were parsed with no language-specific negation rules at all.
+    if re.search(r"[Ͱ-Ͽἀ-῿]", t):
+        return "el"
     if re.search(r"[Ѐ-ӿ]", t):
-        return "ru"
+        # Bulgarian and Russian share the script, and the whole Bulgarian
+        # subcorpus was being labelled "ru".  A single orthographic test is not
+        # enough: ы/э are decisive for Russian and ъ-as-a-vowel for Bulgarian,
+        # but a given sentence may contain none of them.  Score both.
+        ru_markers = ("ы", "э", " не ", "выявл", "определя", "визуализ",
+                      "суставн", "признак", "отмечает")
+        bg_markers = ("ъ", " на ", "нормално", "изобразяване", "б.о.",
+                      "особености", "ставен", "излив", "запазен", "данни за")
+        ru = sum(t.count(m) for m in ru_markers)
+        bg = sum(t.count(m) for m in bg_markers)
+        return "bg" if bg > ru else "ru"
     markers = {
         "tr": (" ve ", " ile ", "izlen", "mevcut", "bulgu", "değişiklik"),
         "es": (" el ", " la ", " de la ", "con ", "sin ", "articul"),
@@ -75,7 +89,15 @@ def detect_language(text: str) -> str:
         "de": (" der ", " die ", " und ", "kein", "gelenk", "nachweis"),
         "it": (" il ", " della ", " con ", "artic", "non "),
         "nl": (" het ", " van ", " met ", "geen ", "gewricht"),
-        "pl": (" nie ", " bez ", " oraz ", "staw"),
+        # Croatian/Serbian/Bosnian.  It was landing in "pl" because Polish's
+        # " bez " marker also matches Croatian "bez znakova", and in "pt" by
+        # score ties -- so two distinct languages were merged into buckets
+        # whose negation cues fit neither.  Listed before "pl" only for
+        # readability; selection is by score, so the markers must discriminate:
+        # đ/ć/č/š/ž and these stems do not occur in Polish.
+        "hr": ("održan", "bez znakova", "primjeren", "prikaz", "menisk",
+               "hrskavic", "ligament je", "koštan", "izljev", "uredne"),
+        "pl": (" nie ", " oraz ", "staw", "więzadł", "łąkotk", "prawidłow"),
         "en": (" the ", " of the ", " with ", " no ", "joint", "signal"),
     }
     scores = {k: sum(t.count(m) for m in ms) for k, ms in markers.items()}

@@ -226,3 +226,137 @@ def test_language_identification_buckets_the_major_scripts():
     assert mod.detect_language("разрыв передней крестообразной связки") == "ru"
     assert mod.detect_language("Ön çapraz bağda yırtık izlenmektedir ve bulgu") == "tr"
     assert mod.detect_language("") == "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# OA vocabulary, grown from the RSNA-2026 corpus audit.                        #
+#                                                                              #
+# Every sentence below is a real (deaccented / truncated) line taken from the  #
+# frequency-ranked unmatched-sentence dump of the 4407 training reports.  The  #
+# shipped lexicon scored 0.000 sensitivity on all three OA targets against the #
+# 58 gold-labelled studies, with 99.6 / 100 / 94.1 % of reports registering    #
+# "not mentioned" -- these pin the fix so it cannot silently regress.          #
+# --------------------------------------------------------------------------- #
+
+OA_CASES = [
+    ("oa patelofemoral.", "PF OA", Assertion.POSITIVE),
+    ("condropatia rotuliana.", "PF OA", Assertion.POSITIVE),
+    ("geen majeure kraakbeendefecten patellofemoraal.", "PF OA", Assertion.NEGATIVE),
+    ("geen majeure kraakbeendefecten mediaal en lateraal femorotibiaal.",
+     "Medial OA", Assertion.NEGATIVE),
+    ("keine hohergradige chondropathie femoropatellar und femorotibial.",
+     "PF OA", Assertion.NEGATIVE),
+    ("hondromalacija ii. stupnja hrskavice medijalne fasete patele.",
+     "PF OA", Assertion.POSITIVE),
+    ("Full thickness cartilage loss along the medial femoral condyle "
+     "and medial tibial plateau.", "Medial OA", Assertion.POSITIVE),
+    ("diz eklemindeki trikompartmantal dejeneratif eklem hastaligi",
+     "Medial OA", Assertion.POSITIVE),
+    ("petits osteophytes marginaux.", "Medial OA", Assertion.POSITIVE),
+]
+
+
+@pytest.mark.parametrize("text,label,want", OA_CASES)
+def test_oa_vocabulary_from_corpus_audit(onto, text, label, want):
+    assert onto.to_weak_labels(onto.extract(text))[label][0] is want
+
+
+def test_tricompartmental_asserts_all_three_oa_labels(onto):
+    """One word, three targets.
+
+    Without this the sentence resolves to compartment ``None``, every OA label
+    lands at 0.425 confidence, and the weak-label loss -- which gates on
+    confidence -- discards all three.
+    """
+    for text in ("tricompartmental marginal osteophytes",
+                 "oa of all three compartments."):
+        weak = onto.to_weak_labels(onto.extract(text))
+        for label in ("Medial OA", "Lateral OA", "PF OA"):
+            assert weak[label][0] is Assertion.POSITIVE, (text, label)
+            assert weak[label][1] > 0.6, (text, label)
+
+
+def test_patellofemoral_anatomy_beats_a_medial_lateral_modifier(onto):
+    """"Lateral trochlea" is patellofemoral OA, not lateral-compartment OA.
+
+    The modifier names a facet *within* the patellofemoral joint.  Routing it
+    to Lateral OA is not a near miss: it is a wrong label on one target and a
+    missing one on another.
+    """
+    text = ("Full thickness cartilage defect, 1.2x1.5cm. at lateral trochlea "
+            "with subchondral bone edema.")
+    weak = onto.to_weak_labels(onto.extract(text))
+    assert weak["PF OA"][0] is Assertion.POSITIVE
+    assert weak["PF OA"][1] > 0.6
+    assert weak["Lateral OA"][0] is Assertion.NOT_MENTIONED
+
+    spanish = ("Condropatia focal grado 4 del aspecto inferior de la vertiente "
+               "medial de la troclea femoral.")
+    weak = onto.to_weak_labels(onto.extract(spanish))
+    assert weak["PF OA"][0] is Assertion.POSITIVE
+    assert weak["Medial OA"][0] is Assertion.NOT_MENTIONED
+
+
+def test_oa_vocabulary_does_not_leak_into_the_meniscus_labels(onto):
+    """"Degenerative" qualifies menisci too; it must not become an OA positive
+    that outranks the meniscal assertion in the same sentence."""
+    text = "degenerative signal throughout the lateral meniscus without surfacing tear."
+    weak = onto.to_weak_labels(onto.extract(text))
+    assert weak["Lateral Meniscus"][0] is Assertion.NEGATIVE
+
+
+def test_measurement_and_ordinal_periods_do_not_split_a_sentence():
+    """A finding must stay attached to the compartment that qualifies it.
+
+    ``cartilage defect, 1.2x1.5cm. | at lateral trochlea`` orphans the finding
+    from "trochlea", and the orphan resolves to compartment ``None`` -- halving
+    its confidence and dropping it below every downstream gate.
+    """
+    from kairos.text.ontology import normalise_text, split_sentences
+
+    assert len(split_sentences(normalise_text(
+        "Cartilage defect, 1.2x1.5cm. at lateral trochlea."))) == 1
+    assert len(split_sentences(normalise_text(
+        "Hondromalacija ii. stupnja hrskavice."))) == 1
+    # ... while genuine sentence boundaries still split.
+    assert len(split_sentences(normalise_text(
+        "No fracture is seen. ACL is intact."))) == 2
+
+
+def test_short_negation_cues_do_not_fire_inside_other_languages(onto):
+    """``_find_cue`` scans every language's cue list against every sentence.
+
+    A two-letter cue therefore matches inside unrelated words: Croatian ``ne ``
+    fires on the English "bo|ne edema|" and flips a positive OA finding to a
+    negation.  Cues must be long enough to survive that.
+    """
+    positives = [
+        ("Osteophytes at the medial femoral condyle with subchondral bone edema.",
+         "Medial OA"),
+        ("Full thickness cartilage defect at lateral trochlea with bone edema.",
+         "PF OA"),
+        ("Bone marrow edema of the lateral tibial plateau.", "Contusion"),
+    ]
+    for text, label in positives:
+        got = onto.to_weak_labels(onto.extract(text))[label][0]
+        assert got is Assertion.POSITIVE, (text, label, got)
+
+
+def test_language_identification_covers_the_corpus_languages():
+    """Greek was 7.5 % of the corpus and fell entirely into "unknown"; Bulgarian
+    was labelled Russian; Croatian was labelled Polish via Polish's ``bez``."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "parse_reports",
+        Path(__file__).resolve().parent.parent / "scripts" / "02_parse_reports.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert mod.detect_language("χωρίς ενδαρθρική συλλογή υγρού.") == "el"
+    assert mod.detect_language("нормално изобразяване на латералния менискус.") == "bg"
+    assert mod.detect_language("разрыв передней крестообразной связки, не выявлено") == "ru"
+    assert mod.detect_language(
+        "medijalni menisk bez znakova rupture i degeneracije, uredan prikaz") == "hr"

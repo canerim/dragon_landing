@@ -84,6 +84,20 @@ def _deaccent(text: str) -> str:
 
 _SENT_SPLIT = re.compile(r"(?<=[.!?;])\s+|\n+|\s+[-•·]\s+")
 
+#: A trailing "sentence-final" period that is not one: a measurement
+#: (``1.2x1.5cm.``), a roman ordinal (``hondromalacija ii.``) or a list number
+#: (``impression: 1.``).  Splitting there severs a finding from the compartment
+#: that qualifies it -- "cartilage defect, 1.2x1.5cm." / "at lateral trochlea."
+#: -- and the orphaned half resolves to compartment ``None``, which multiplies
+#: confidence by 0.5 and drops the match below every downstream gate.
+#:
+#: Case is *not* usable as a signal here: ``normalise_text`` casefolds before
+#: this runs, so "the next fragment starts lowercase" is true of every fragment.
+_CONTINUES = re.compile(
+    r"(?:^|\s)(?:[0-9][^\s]*|i|ii|iii|iv|v|vi|vii|viii|ix|x|cm|mm|ml|nr|no|fig)\.$",
+    re.IGNORECASE,
+)
+
 
 def split_sentences(text: str) -> list[str]:
     """Sentence segmentation tuned for radiology reports.
@@ -92,11 +106,18 @@ def split_sentences(text: str) -> list[str]:
     semicolon-chained clauses, and an off-the-shelf sentence splitter merges a
     whole findings section into one "sentence" -- which destroys negation scope
     and therefore every weak label derived from it.  We split on terminal
-    punctuation, newlines *and* bullet markers, then drop fragments shorter
+    punctuation, newlines *and* bullet markers, then rejoin the fragments whose
+    "terminator" was a measurement or an ordinal, and drop what is left shorter
     than three characters.
     """
     parts = [p.strip() for p in _SENT_SPLIT.split(text) if p and p.strip()]
-    return [p for p in parts if len(p) >= 3]
+    merged: list[str] = []
+    for p in parts:
+        if merged and _CONTINUES.search(merged[-1]):
+            merged[-1] = f"{merged[-1]} {p}"
+        else:
+            merged.append(p)
+    return [p for p in merged if len(p) >= 3]
 
 
 # --------------------------------------------------------------------------- #
@@ -117,6 +138,21 @@ NEGATION_CUES: dict[str, tuple[str, ...]] = {
     "nl": ("geen ", "zonder ", "niet ", "ongestoord", "intact", "normaal"),
     "pl": ("bez ", "nie ", "brak ", "prawidłow", "nieuszkodzon"),
     "ru": ("нет ", "не ", "без ", "отсутств", "интакт", "не выявлен"),
+    # Bulgarian, Croatian/Serbian and Greek were absent entirely.  Because
+    # ``_find_cue`` scans every language's cue list regardless of the detected
+    # language, an absent list does not merely weaken those reports -- it means
+    # a negated finding in them is read as POSITIVE.  Greek was 7.5 % of the
+    # corpus and every "χωρίς ενδαρθρική συλλογή υγρού" was a false Effusion.
+    "bg": ("няма ", "не ", "без ", "б.о.", "без особености", "нормално",
+           "запазен", "интакт", "не се "),
+    # NB: no bare ``ne ``.  ``_find_cue`` tests every language's cues against
+    # every sentence regardless of the detected language, so a two-letter cue
+    # fires inside unrelated words in other languages -- ``ne `` matches the
+    # English "bo|ne edema|", turning a positive OA finding into a negation.
+    "hr": ("bez ", "nema ", "nije ", "nisu ", "ne nalazi", "uredn",
+           "primjeren", "održan", "intaktn", "bez znakova", "bez osobitosti"),
+    "el": ("χωρίς", "δεν ", "ουδεμία", "ακέραι", "φυσιολογικ",
+           "εντός του φυσιολογικού", "χωρίς ευρήματα"),
     "zh": ("未见", "无", "阴性", "未显示", "正常"),
     "ja": ("認めない", "なし", "陰性", "指摘なし", "正常"),
 }
@@ -138,6 +174,10 @@ UNCERTAINTY_CUES: dict[str, tuple[str, ...]] = {
     "nl": ("mogelijk", "waarschijnlijk", "verdacht", "niet uit te sluiten"),
     "pl": ("możliw", "prawdopodobn", "podejrzan", "nie można wykluczyć"),
     "ru": ("возможно", "вероятно", "подозрение", "не исключа", "сомнительн"),
+    "bg": ("вероятно", "възможно", "съмнение", "не може да се изключи"),
+    "hr": ("vjerojatno", "moguć", "sumnja", "ne može se isključiti",
+           "suspektn", "vjerojatna"),
+    "el": ("πιθαν", "ύποπτ", "δεν αποκλείεται", "συμβατ"),
     "zh": ("可能", "考虑", "疑似", "不除外"),
     "ja": ("疑い", "可能性", "示唆", "否定できない"),
 }
@@ -152,11 +192,41 @@ HISTORICITY_CUES: tuple[str, ...] = (
 #: Words that flip the compartment.  Kept separate from the concept lexicon so
 #: that a single medial/lateral list serves all twelve labels.
 _MEDIAL = ("medial", "mediale", "medialen", "medyal", "iç ", "interno", "interne",
-           "przyśrodkow", "медиальн", "内侧", "内側")
+           "przyśrodkow", "медиальн", "内侧", "内側",
+           # Added from the RSNA-2026 corpus audit.  Dutch ``mediaal`` and
+           # Croatian ``medijaln`` do not contain the substring ``medial``, so
+           # the original list silently returned ``None`` for every Dutch and
+           # Croatian sentence -- which multiplied confidence by 0.5 and put
+           # every compartment label under the 0.6 gate.
+           "mediaal", "medijaln", "медиал", "έσω", "εσω")
 _LATERAL = ("lateral", "laterale", "lateralen", "dış ", "externo", "externe",
-            "boczn", "латеральн", "外侧", "外側")
-_PATELLOFEMORAL = ("patellofemoral", "patellofemorale", "patellar", "retropatellar",
-                   "patella", "diz kapağı", "髌股", "膝蓋大腿")
+            "boczn", "латеральн", "外侧", "外側",
+            "lateraal", "латерал", "έξω", "εξω")
+#: Patellofemoral markers.  ``patellofemora`` (no trailing ``l``) is deliberate:
+#: it covers ``patellofemoral``/``patellofemorale``/``patellofemoraal`` in one
+#: form, which the fully-spelled variant does not.
+_PATELLOFEMORAL = ("patellofemora", "patelofemora", "femoropatella", "patellar",
+                   "retropatellar", "patella", "rotulian", "rotulien",
+                   "diz kapağı", "髌股", "膝蓋大腿")
+
+#: Anatomy that is decisive for the *patellofemoral* compartment even when a
+#: medial/lateral modifier is present: "lateral trochlea" and "medial patellar
+#: facet" are patellofemoral OA, not tibiofemoral.  Used only for the three OA
+#: labels -- the meniscus and MCL labels keep the plain medial/lateral rule,
+#: where a patellar mention in the same sentence carries no such implication.
+_PF_DECISIVE = ("trochlea", "trocle", "troklea", "трохле", "patellar facet",
+                "faseta patele", "fasete patele", "faceta rotuliana",
+                "patellofemora", "patelofemora", "femoropatella",
+                "retropatellar", "rotulian", "patele", "patelarn")
+
+#: One word that asserts all three OA compartments at once.  Without this the
+#: sentence resolves to ``None`` and all three labels land at 0.425 confidence,
+#: i.e. invisible to any downstream gate.
+_TRICOMPARTMENTAL = ("tricompartmental", "tricompartimental", "tri-compartmental",
+                     "tricompartimentale", "trikompartman", "trikompartmantal",
+                     "trikompartmentell", "all three compartments",
+                     "three compartments", "tres compartimentos",
+                     "trois compartiments", "sva tri kompartmana")
 
 
 @dataclass(slots=True)
@@ -251,6 +321,8 @@ class KneeOntology:
     @staticmethod
     def compartment_of(sentence: str) -> str | None:
         s = _deaccent(sentence.casefold())
+        if any(_deaccent(k) in s for k in _TRICOMPARTMENTAL):
+            return "all"
         has_m = any(_deaccent(k) in s for k in _MEDIAL)
         has_l = any(_deaccent(k) in s for k in _LATERAL)
         has_p = any(_deaccent(k) in s for k in _PATELLOFEMORAL)
@@ -264,6 +336,29 @@ class KneeOntology:
             return "both"
         return None
 
+    @staticmethod
+    def compartment_for_oa(sentence: str) -> str | None:
+        """Compartment resolution for the three OA labels.
+
+        Differs from :meth:`compartment_of` in one respect: decisive
+        patellofemoral anatomy wins over a medial/lateral modifier, because in
+        "full thickness cartilage defect at the lateral trochlea" or "high-grade
+        cartilage loss along the medial patellar facet" the modifier names a
+        *facet within the patellofemoral joint*, not a tibiofemoral compartment.
+        Routing those to Lateral/Medial OA is not a near miss -- it is a wrong
+        label on one target and a missing one on another.
+
+        The meniscus and MCL labels deliberately keep the plain rule: a patellar
+        mention in the same sentence as a meniscal tear implies nothing about
+        which meniscus is torn.
+        """
+        s = _deaccent(sentence.casefold())
+        if any(_deaccent(k) in s for k in _TRICOMPARTMENTAL):
+            return "all"
+        if any(_deaccent(k) in s for k in _PF_DECISIVE):
+            return "patellofemoral"
+        return KneeOntology.compartment_of(sentence)
+
     # -- extraction ------------------------------------------------------ #
 
     def extract(self, report: str, *, language: str | None = None) -> list[ConceptMatch]:
@@ -272,16 +367,24 @@ class KneeOntology:
             de = _deaccent(sent)
             historic = any(_deaccent(h) in de for h in HISTORICITY_CUES)
             comp = self.compartment_of(sent)
+            comp_oa = self.compartment_for_oa(sent)
             for label, rx in self._compiled.items():
                 for m in rx.finditer(de):
                     a, conf, cue, cue_lang = self.assert_state(sent, m.span())
                     if self.require_compartment and label in _COMPARTMENT_LABELS:
                         want = _COMPARTMENT_LABELS[label]
-                        if comp is None:
+                        # A local name: rebinding ``comp`` here would leak the
+                        # OA-specific resolution to every label examined later
+                        # in the same sentence.
+                        c = comp_oa if label in _OA_LABELS else comp
+                        if c == "all":
+                            # "Tricompartmental OA" asserts all three at once.
+                            pass
+                        elif c is None:
                             conf *= 0.5
-                        elif comp == "both":
+                        elif c == "both":
                             conf *= 0.8
-                        elif comp != want:
+                        elif c != want:
                             continue  # explicit opposite compartment: not this label
                     if historic:
                         # Chronic / post-operative findings are frequently not
@@ -296,7 +399,7 @@ class KneeOntology:
                             sentence=sent,
                             span=m.span(),
                             cue=cue,
-                            compartment_hint=comp,
+                            compartment_hint=comp_oa if label in _OA_LABELS else comp,
                             language=language or cue_lang,
                         )
                     )
@@ -323,6 +426,62 @@ class KneeOntology:
         for t in TARGETS:
             best.setdefault(t, (Assertion.NOT_MENTIONED, 0.0))
         return best
+
+
+_OA_LABELS = ("Medial OA", "Lateral OA", "PF OA")
+
+#: Vocabulary that means "degenerative disease of *a* compartment" without
+#: naming which.  It is shared by all three OA labels and routed by
+#: :meth:`KneeOntology.compartment_for_oa`, which is what makes one list serve
+#: three targets: "cartilage loss along the medial femoral condyle" reaches
+#: Medial OA and is skipped for Lateral OA by the ``c != want`` branch.
+#:
+#: Assembled from the frequency-ranked unmatched sentences of the RSNA-2026
+#: corpus, per the workflow this module's docstring prescribes.  The original
+#: list held only formal phrasings ("medial compartment osteoarthritis") and
+#: scored 0.000 sensitivity on all three OA targets, with 99.6 / 100 / 94.1 %
+#: of reports registering "not mentioned".
+_OA_GENERIC: tuple[str, ...] = (
+    # -- osteoarthritis / arthrosis ------------------------------------- #
+    "osteoarthritis", "osteoarthrosis", "osteoarthritic", "arthrosis",
+    "arthrose", "gonarthrose", "gonartroz", "artrosis", "artroz", "artrose",
+    "osteoartrit", "artritick", "artriticke", "osteoartriticke", "artrotic",
+    "arthritis of the", "остеоартр", "οστεοαρθρ",
+    # Bare "OA" is how this corpus most often writes it ("oa of all three
+    # compartments", "oa patelofemoral").  Anchored to a following compartment
+    # or preposition rather than listed bare: an unanchored "oa" matches inside
+    # any word ending in those two letters.
+    "oa of", "oa patel", "oa medial", "oa lateral", "oa femorotibial",
+    "oa de ", "oa del ", "oa dell",
+    # -- osteophytes ----------------------------------------------------- #
+    "osteophyt", "osteofit", "osteofito", "osteofiet", "osteofyt",
+    "ostephyt", "остеофит", "οστεοφ",
+    # -- chondropathy / chondromalacia / chondrosis ---------------------- #
+    "chondropath", "chondromalac", "chondrosis", "chondrose",
+    "condropat", "condromalac", "kondropat", "kondromalaz",
+    "hondropat", "hondromalacij", "chondropathie", "chondromalazi",
+    "χονδρομαλ", "хондромалаци",
+    # -- cartilage loss / defect ----------------------------------------- #
+    "cartilage loss", "cartilage defect", "cartilage thinning",
+    "cartilage heterogeneity", "chondral defect", "chondral loss",
+    "chondral ulcer", "cartilage denudation", "osteochondral defect",
+    "knorpeldefekt", "knorpelschaden", "knorpelverlust",
+    "kraakbeendefect", "kraakbeenverlies",
+    "perte de cartilage", "perte cartilagineuse", "ulcere chondral",
+    "perdida de cartilago", "ulcera condral", "defecto condral",
+    "kikirdak kaybi", "kikirdak defekt", "kikirdak incelme",
+    "denudacija hrskavice", "erozije zglobnih hrskavica",
+    # -- degenerative joint disease -------------------------------------- #
+    "degenerative joint disease", "degenerative change",
+    "dejeneratif eklem", "degenerative veranderung", "degenerative veraenderung",
+    "cambios degenerativos", "changements degeneratifs",
+    "degeneratieve verandering", "degenerativne promjene",
+    "osteoartriticke promjene", "дегенеративн", "εκφυλιστικ",
+    # -- joint-space narrowing / subchondral reaction -------------------- #
+    "joint space narrowing", "subchondral sclerosis", "subchondral cyst",
+    "subchondral cystic", "subkondral skleroz", "subchondrale sklerose",
+    "gelenkspaltverschmalerung", "pinzamiento articular",
+)
 
 
 _COMPARTMENT_LABELS = {
@@ -361,22 +520,23 @@ _DEFAULT_LEXICON: dict[str, tuple[str, ...]] = {
         "menisco laterale", "laterale meniscus", "lakotka boczna",
         "латеральный мениск", "外侧半月板", "外側半月板",
     ),
-    "Medial OA": (
+    "Medial OA": _OA_GENERIC + (
         "medial compartment osteoarthritis", "medial compartment degenerative",
         "medial chondrosis", "medial cartilage loss", "ic kompartman",
         "iç kompartman", "artrosis medial", "gonarthrose mediale",
         "mediale gonarthrose", "medial osteoarthritis", "内侧间室退变",
     ),
-    "Lateral OA": (
+    "Lateral OA": _OA_GENERIC + (
         "lateral compartment osteoarthritis", "lateral compartment degenerative",
         "lateral chondrosis", "lateral cartilage loss", "dis kompartman",
         "dış kompartman", "artrosis lateral", "gonarthrose laterale",
         "laterale gonarthrose", "lateral osteoarthritis", "外侧间室退变",
     ),
-    "PF OA": (
+    "PF OA": _OA_GENERIC + (
         "patellofemoral osteoarthritis", "patellofemoral chondrosis",
         "retropatellar chondro", "patellar cartilage", "patellofemoral artroz",
         "kondromalazi", "chondromalacia", "artrosis patelofemoral",
+        "condropatia rotuliana", "condropatia femoropatelar",
         "retropatellare chondropathie", "髌股关节退变", "膝蓋大腿関節症",
     ),
     "Effusion": (
