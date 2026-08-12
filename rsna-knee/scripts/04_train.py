@@ -239,6 +239,18 @@ def main() -> int:
     ap.add_argument("--synthetic-n", type=int, default=64)
     args = ap.parse_args()
 
+    # bf16 needs Ampere (sm_80+).  Kaggle serves P100 (sm_60) and T4 (sm_75),
+    # where the request does not raise at autocast time -- it surfaces deep in
+    # the first conv as cuDNN's "GET was unable to find an engine to execute
+    # this computation", which reads like a broken install rather than an
+    # unsupported dtype.  Downgrade loudly instead.
+    if args.amp == "bf16" and str(args.device).startswith("cuda"):
+        if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
+            name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "?"
+            print(f"!! {name} does not support bf16; using fp16 instead "
+                  "(pass --amp fp32 to disable mixed precision)")
+            args.amp = "fp16"
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
