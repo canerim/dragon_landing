@@ -360,3 +360,66 @@ def test_language_identification_covers_the_corpus_languages():
     assert mod.detect_language("разрыв передней крестообразной связки, не выявлено") == "ru"
     assert mod.detect_language(
         "medijalni menisk bez znakova rupture i degeneracije, uredan prikaz") == "hr"
+
+
+ROUND2_CASES = [
+    # Spanish names the compartments interno/externo, not medial/lateral.
+    ("resultados: rotura de menisco interno.", "Medial Meniscus", Assertion.POSITIVE),
+    ("rotura de menisco interno.", "Lateral Meniscus", Assertion.NOT_MENTIONED),
+    ("el menisque externe est sans particularite.", "Lateral Meniscus", Assertion.NEGATIVE),
+    ("lateralni menisk bez znakova degeneracije ili rupture.",
+     "Lateral Meniscus", Assertion.NEGATIVE),
+    ("нормално изобразяване на латералния менискус.",
+     "Lateral Meniscus", Assertion.NEGATIVE),
+    # Effusion was missing in five of the corpus languages.
+    ("малък ставен излив.", "Effusion", Assertion.POSITIVE),
+    ("няма данни за ставен излив.", "Effusion", Assertion.NEGATIVE),
+    ("bez signifikantnog izljeva u zglob.", "Effusion", Assertion.NEGATIVE),
+    ("matige hydrops.", "Effusion", Assertion.POSITIVE),
+    ("akzentuierte gelenkflussigkeit.", "Effusion", Assertion.POSITIVE),
+    ("diz eklemi ici sivi miktari hafif derecede artmis.", "Effusion", Assertion.POSITIVE),
+    ("diz eklemi ici sivi miktari normal.", "Effusion", Assertion.NEGATIVE),
+    ("bez znakova poplitealne ciste.", "Baker's", Assertion.NEGATIVE),
+    ("бекерова киста.", "Baker's", Assertion.POSITIVE),
+    ("no hay quistes popliteos patologicos.", "Baker's", Assertion.NEGATIVE),
+    ("geen botoedeem.", "Contusion", Assertion.NEGATIVE),
+    ("kein subchondrales knochenodem.", "Contusion", Assertion.NEGATIVE),
+    ("manji izljev u zglobnim prostorima, uz blazu proliferaciju sinovije.",
+     "Synovitis", Assertion.POSITIVE),
+]
+
+
+@pytest.mark.parametrize("text,label,want", ROUND2_CASES)
+def test_second_round_corpus_vocabulary(onto, text, label, want):
+    assert onto.to_weak_labels(onto.extract(text))[label][0] is want
+
+
+def test_pseudo_negation_does_not_negate(onto):
+    """"quiste poplíteo **no** complicado" is an *uncomplicated* cyst -- the
+    negation word qualifies "complicado", not the cyst's existence."""
+    weak = onto.to_weak_labels(onto.extract("pequeno quiste popliteo no complicado."))
+    assert weak["Baker's"][0] is Assertion.POSITIVE
+
+
+def test_cue_needs_a_leading_word_boundary(onto):
+    """A bare cue must not fire inside an unrelated word.
+
+    Spanish ``pequeño `` ends in ``no ``, so a plain substring test reported
+    every "pequeño quiste poplíteo" as an absent cyst.  The cues carry a
+    trailing space to guard their right edge; nothing guarded the left.
+    """
+    assert onto.to_weak_labels(
+        onto.extract("pequeno quiste popliteo."))["Baker's"][0] is Assertion.POSITIVE
+    # ... and a real leading negation still fires.
+    assert onto.to_weak_labels(
+        onto.extract("no popliteal cyst."))["Baker's"][0] is Assertion.NEGATIVE
+
+
+def test_word_boundary_rule_does_not_break_cjk_negation(onto):
+    """``\\b`` is meaningless between ideographs -- every CJK character is a word
+    character, so a boundary-anchored cue preceded by another ideograph would
+    never match and Chinese/Japanese negation would silently stop working."""
+    assert onto.to_weak_labels(
+        onto.extract("前十字靭帯の完全断裂を認めない"))["ACL"] [0] is Assertion.NEGATIVE
+    assert onto.to_weak_labels(
+        onto.extract("未见前交叉韧带断裂"))["ACL"][0] is Assertion.NEGATIVE

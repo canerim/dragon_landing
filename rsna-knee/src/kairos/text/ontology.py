@@ -182,6 +182,19 @@ UNCERTAINTY_CUES: dict[str, tuple[str, ...]] = {
     "ja": ("疑い", "可能性", "示唆", "否定できない"),
 }
 
+#: Phrases that *contain* a negation word but negate nothing -- NegEx calls
+#: these pseudo-negations.  They are removed from the sentence before cue
+#: search, because otherwise "pequeño quiste poplíteo **no** complicado"
+#: ("uncomplicated popliteal cyst") reports the cyst as absent, which is the
+#: opposite of what it says.  Ordered longest-first at use so that a longer
+#: phrase is stripped before a shorter one nested inside it.
+PSEUDO_NEGATION_CUES: tuple[str, ...] = (
+    "no complicado", "no complicada", "non complique", "not complicated",
+    "not previously discussed", "no relevant prior", "no significant change",
+    "no aggressive", "sin cambios significativos", "sin particularidad",
+    "geen relevante", "keine relevante", "bez znacajne promjene",
+)
+
 HISTORICITY_CUES: tuple[str, ...] = (
     "post-operative", "postoperative", "status post", "prior", "previous", "old",
     "chronic", "sequela", "postop", "ameliyat", "geçirilmiş", "eski", "kronik",
@@ -270,12 +283,39 @@ class KneeOntology:
     # -- assertion ------------------------------------------------------- #
 
     @staticmethod
+    def _cue_present(cue: str, haystack: str) -> bool:
+        """Substring test with a leading word boundary where that is meaningful.
+
+        A bare substring test lets a short cue fire inside an unrelated word,
+        across languages: Spanish ``pequeño quiste poplíteo`` contains ``no ``
+        and so reported the cyst as absent.  The cues carry a trailing space to
+        guard their right edge; nothing guarded the left.
+
+        The boundary is applied only for scripts that separate words with
+        spaces.  ``\\b`` is meaningless for Chinese and Japanese -- every
+        ideograph is a word character, so a cue preceded by another ideograph
+        would never match and both languages' negation would silently stop
+        working.
+        """
+        cd = _deaccent(cue)
+        if not cd:
+            return False
+        if re.match(r"[぀-ヿ一-鿿]", cd):
+            return cd in haystack
+        return re.search(r"\b" + re.escape(cd), haystack) is not None
+
+    @staticmethod
     def _find_cue(sentence: str, cues: dict[str, tuple[str, ...]]) -> tuple[str | None, str | None]:
         s = _deaccent(sentence)
+        # Blank out pseudo-negations first, longest match wins, so that the
+        # negation word inside them cannot be found by the scan below.
+        for p in sorted(PSEUDO_NEGATION_CUES, key=len, reverse=True):
+            pd_ = _deaccent(p)
+            if pd_ in s:
+                s = s.replace(pd_, " " * len(pd_))
         for lang, forms in cues.items():
             for c in forms:
-                cd = _deaccent(c)
-                if cd and cd in s:
+                if KneeOntology._cue_present(c, s):
                     return c, lang
         return None, None
 
@@ -430,6 +470,21 @@ class KneeOntology:
 
 _OA_LABELS = ("Medial OA", "Lateral OA", "PF OA")
 
+#: The bare word "meniscus" in each language, shared by both meniscus labels
+#: and routed by the compartment resolver -- exactly as :data:`_OA_GENERIC` is.
+#:
+#: Spanish names the compartments ``interno``/``externo``, not
+#: ``medial``/``lateral``, so ``rotura de menisco interno`` (165 occurrences in
+#: the corpus, the single most frequent finding sentence in that language)
+#: matched nothing: the lexicon held ``menisco medial``.  ``interno`` was
+#: already a medial marker, so supplying the bare noun is all that was needed.
+#:
+#: Substring matching does the morphology: ``menisc`` covers meniscus/menisci/
+#: menisco/meniscal, ``menisk`` covers menisk/meniskus/menisküs.
+_MENISCUS_GENERIC: tuple[str, ...] = (
+    "menisc", "menisk", "menisque", "μηνισκ", "мениск", "半月板", "半月",
+)
+
 #: Vocabulary that means "degenerative disease of *a* compartment" without
 #: naming which.  It is shared by all three OA labels and routed by
 #: :meth:`KneeOntology.compartment_for_oa`, which is what makes one list serve
@@ -508,15 +563,17 @@ _DEFAULT_LEXICON: dict[str, tuple[str, ...]] = {
         "innenband", "mediales kollateralband", "legamento collaterale mediale",
         "mediale collaterale band", "внутренняя боковая", "内侧副韧带", "内側側副靭帯",
     ),
-    "Medial Meniscus": (
+    "Medial Meniscus": _MENISCUS_GENERIC + (
         "medial meniscus", "medial menisc", "ic menisk", "iç menisküs",
-        "menisco medial", "menisque medial", "innenmeniskus", "medialer meniskus",
+        "menisco medial", "menisco interno", "menisque medial", "menisque interne",
+        "innenmeniskus", "medialer meniskus",
         "menisco mediale", "mediale meniscus", "lakotka przysrodkowa",
         "медиальный мениск", "内侧半月板", "内側半月板",
     ),
-    "Lateral Meniscus": (
+    "Lateral Meniscus": _MENISCUS_GENERIC + (
         "lateral meniscus", "lateral menisc", "dis menisk", "dış menisküs",
-        "menisco lateral", "menisque lateral", "aussenmeniskus", "lateraler meniskus",
+        "menisco lateral", "menisco externo", "menisque lateral", "menisque externe",
+        "aussenmeniskus", "lateraler meniskus",
         "menisco laterale", "laterale meniscus", "lakotka boczna",
         "латеральный мениск", "外侧半月板", "外側半月板",
     ),
@@ -544,17 +601,35 @@ _DEFAULT_LEXICON: dict[str, tuple[str, ...]] = {
         "derrame articular", "epanchement", "gelenkerguss", "erguss",
         "versamento articolare", "gewrichtsvocht", "wysiek",
         "выпот", "关节积液", "関節液貯留",
+        # Absent in five of the corpus languages, which is the likeliest
+        # explanation for this label's 0.478 specificity: the parser saw the
+        # English positives and none of the other languages' negations.
+        "ставен излив", "излив",                       # bg
+        "izljev", "hidrops",                           # hr
+        "συλλογη υγρου", "ενδαρθρικη συλλογη",         # el
+        "hydrops", "suprapatellaire recessus",         # nl
+        "gelenkflussigkeit", "kniegelenkerguss",       # de
+        "ici sivi", "sivi miktari", "sivi artis", "sıvı artışı",  # tr
     ),
     "Synovitis": (
         "synovitis", "synovial hypertroph", "synovial prolifer", "sinovit",
-        "sinovyal", "sinovitis", "synovite", "synovitis", "sinovite",
-        "synovitis", "zapalenie blony maziowej", "синовит", "滑膜炎", "滑膜炎",
+        "sinovyal", "sinovitis", "synovite", "sinovite",
+        "zapalenie blony maziowej", "синовит", "滑膜炎",
+        "synovial thicken", "thickened synovial", "thickend synovial",
+        "synovial tissue", "synovialitis",
+        "proliferacij", "sinovij",                                     # hr
+        "синовиал", "хипертрофия на синовията",                       # bg
+        "υμενιτ", "αρθρικου υμενα",                                   # el
     ),
     "Baker's": (
         "baker", "popliteal cyst", "baker kisti", "popliteal kist",
         "quiste de baker", "kyste de baker", "bakerzyste", "poplitealzyste",
         "cisti di baker", "bakercyste", "torbiel bakera",
         "киста бейкера", "腘窝囊肿", "ベーカー嚢腫",
+        # Near misses against forms already present -- different word order or
+        # inflection is enough to defeat substring matching.
+        "poplitealn", "quiste poplite", "quistes poplite", "kyste poplite",
+        "бекеров", "поплитеална киста", "κυστη poplitea",
     ),
     "Contusion": (
         "contusion", "bone bruise", "bone marrow edema", "marrow oedema",
@@ -563,6 +638,12 @@ _DEFAULT_LEXICON: dict[str, tuple[str, ...]] = {
         "knochenkontusion", "contusione ossea", "edema midollare",
         "botmergoedeem", "stluczenie kosci", "отек костного мозга",
         "骨挫伤", "骨挫傷",
+        "knochenodem", "knochenmarksodem", "botoedeem",   # de / nl
+        "kostani edem", "edem kostane srzi",              # hr
+        "костномозъчен едем", "костен едем",              # bg
+        "οιδημα μυελου", "οστικο οιδημα",                 # el
+        "oedeme osseux", "oedeme de la moelle",           # fr
+        "subchondral bone edema", "subchondral marrow edema",
     ),
     "Fracture": (
         "fracture", "fraktur", "kirik", "kırık", "cortical break",
