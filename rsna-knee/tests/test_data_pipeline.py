@@ -348,3 +348,108 @@ def test_dataloader_workers_get_independent_augmentation_streams():
     # shared Generator the two streams are byte-identical in pairs.
     pairs = [(firsts[i], firsts[i + 1]) for i in range(0, len(firsts) - 1, 2)]
     assert not all(a == b for a, b in pairs), f"workers are in lockstep: {firsts}"
+
+
+# --------------------------------------------------------------------------- #
+# Study cache (scripts/03_build_cache.py)                                      #
+# --------------------------------------------------------------------------- #
+
+
+def _cache_module():
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root / "scripts"))
+    from importlib import import_module
+
+    return import_module("03_build_cache")
+
+
+def _synthetic_study(uid: str, n_series: int = 3):
+    import numpy as np
+
+    from kairos.constants import Plane
+    from kairos.data.dataset import SeriesRecord, StudyRecord
+
+    rng = np.random.default_rng(0)
+    rec = StudyRecord(study_uid=uid)
+    for s in range(n_series):
+        n = 7 + s
+        rec.series.append(SeriesRecord(
+            series_uid=f"{uid}.{s}", family_index=s + 1, plane=Plane.SAGITTAL,
+            pixels=rng.normal(0, 1, (n, 32, 32)).astype(np.float32),
+            z_mm=np.cumsum(rng.uniform(2.7, 3.3, n)).astype(np.float32),
+            spacing_mm=3.0, in_plane_mm=0.5, manufacturer_id=2, fat_sat_id=1,
+            field_strength=1.5, te_ms=35.0, tr_ms=3000.0, mirrored=True))
+    return rec
+
+
+def test_cache_round_trip_preserves_every_field(tmp_path):
+    """The cache replaces the DICOM reader, so anything it drops is data the
+    model silently stops seeing -- and nothing downstream would report it."""
+    import numpy as np
+
+    mod = _cache_module()
+    uid = "1.2.826.0.1.3680043.8.498.1000487322909905386909332429219581726"
+    rec = _synthetic_study(uid)
+
+    mod._write(mod.cache_path(tmp_path, uid), rec, uid)
+    back = mod.load_cached_study(tmp_path, uid)
+
+    assert back.study_uid == uid
+    assert len(back.series) == len(rec.series)
+    for a, b in zip(rec.series, back.series):
+        # float32 out, whatever the storage dtype: the model and the losses run
+        # in float32 and a float16 array silently changes accumulation dtype.
+        assert b.pixels.dtype == np.float32
+        assert np.allclose(a.pixels, b.pixels, atol=1e-2)
+        assert np.allclose(a.z_mm, b.z_mm)
+        assert a.series_uid == b.series_uid
+        assert (a.family_index, a.plane, a.mirrored) == (b.family_index, b.plane, b.mirrored)
+        assert (a.spacing_mm, a.in_plane_mm) == (b.spacing_mm, b.in_plane_mm)
+        assert (a.manufacturer_id, a.fat_sat_id) == (b.manufacturer_id, b.fat_sat_id)
+        assert (a.field_strength, a.te_ms, a.tr_ms) == (b.field_strength, b.te_ms, b.tr_ms)
+
+
+def test_cache_write_leaves_no_partial_file(tmp_path):
+    """np.savez appends '.npz' to any path lacking it, so a '.npz.tmp' target
+    lands at '.npz.tmp.npz' and the write-then-rename renames a missing file."""
+    mod = _cache_module()
+    uid = "1.2.826.0.1.3680043.8.498.42"
+    mod._write(mod.cache_path(tmp_path, uid), _synthetic_study(uid), uid)
+
+    assert mod.cache_path(tmp_path, uid).exists()
+    assert not list(tmp_path.rglob("*.tmp*")), "temporary file left behind"
+
+
+def test_cache_shards_on_the_variable_end_of_the_uid(tmp_path):
+    """Every UID here begins '1.2.826.0.1.3680043.8.498.', so a prefix shard
+    puts all 4407 studies in one directory."""
+    mod = _cache_module()
+    uids = [f"1.2.826.0.1.3680043.8.498.{i:040d}" for i in range(40)]
+    for u in uids:
+        mod._write(mod.cache_path(tmp_path, u), _synthetic_study(u, 1), u)
+    assert len({p.name for p in tmp_path.iterdir() if p.is_dir()}) > 1
+
+
+def test_missing_study_reports_an_error_rather_than_raising(tmp_path):
+    """A study absent from the cache must arrive as an invalid record, so the
+    collator drops it from the OOF instead of scoring it from padding."""
+    mod = _cache_module()
+    rec = mod.load_cached_study(tmp_path, "not.a.real.uid")
+    assert rec.series == []
+    assert rec.errors
+
+
+def test_study_with_no_usable_series_round_trips(tmp_path):
+    """No usable series is a fact about the data. Re-decoding it every epoch to
+    rediscover that is exactly the waste the cache removes."""
+    from kairos.data.dataset import StudyRecord
+
+    mod = _cache_module()
+    uid = "1.2.826.0.1.3680043.8.498.empty"
+    mod._write(mod.cache_path(tmp_path, uid), StudyRecord(study_uid=uid), uid)
+    back = mod.load_cached_study(tmp_path, uid)
+    assert back.series == []
+    assert not back.errors, "an empty-but-present study is not a cache miss"

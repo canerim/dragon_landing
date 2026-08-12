@@ -196,6 +196,12 @@ def main() -> int:
     ap.add_argument("--images", type=Path,
                     help="training image root; defaults to the discovered "
                          "<root>/train_series")
+    ap.add_argument("--cache", type=Path,
+                    help="read pre-decoded studies from a cache built by "
+                         "scripts/03_build_cache.py instead of decoding DICOMs. "
+                         "Decoding is ~40 min/epoch on a 4-core box and is "
+                         "identical every epoch; the cache makes the GPU the "
+                         "bottleneck instead of the CPU.")
     ap.add_argument("--fold", type=int, default=0)
     ap.add_argument("--out", type=Path, default=Path("runs/kairos"))
     ap.add_argument("--budget", choices=("small", "medium", "large"), default="medium")
@@ -300,26 +306,43 @@ def main() -> int:
         fold_of = df["fold"].to_numpy()
         sites, site_col = resolve_environments(df)
 
-        from kairos.data.dataset import load_study
-        from kairos.io.layout import discover
+        if args.cache is not None:
+            if not args.cache.is_dir():
+                ap.error(f"--cache {args.cache} does not exist; build it with "
+                         "scripts/03_build_cache.py")
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from importlib import import_module
 
-        # The images are under <root>/train_series/<study>/<series>/*.dcm, and
-        # <root>/train.csv sits next to it -- so a bare "<root>/train" guess
-        # finds nothing.  Discovery handles that in one place.
-        images = args.images
-        if images is None:
-            layout = discover()
-            images = layout.train_images
-        if images is None or not Path(images).is_dir():
-            ap.error(
-                "could not locate the training images; pass --images explicitly "
-                "(expected <root>/train_series/<StudyInstanceUID>/<SeriesInstanceUID>/*.dcm)"
-            )
-        images = Path(images)
-        print(f"training images: {images}")
+            _cache_mod = import_module("03_build_cache")
+            n_cached = sum(1 for _ in args.cache.rglob("*.npz"))
+            print(f"study cache: {n_cached} studies at {args.cache}")
+            if n_cached < len(uids):
+                print(f"!! cache holds {n_cached} of {len(uids)} cohort studies; "
+                      "the rest will be marked invalid and dropped from the OOF")
 
-        def load_fn(uid: str):
-            return load_study(images / uid, out_size=args.image_size)
+            def load_fn(uid: str):
+                return _cache_mod.load_cached_study(args.cache, uid)
+        else:
+            from kairos.data.dataset import load_study
+            from kairos.io.layout import discover
+
+            # The images are under <root>/train_series/<study>/<series>/*.dcm,
+            # and <root>/train.csv sits next to it -- so a bare "<root>/train"
+            # guess finds nothing.  Discovery handles that in one place.
+            images = args.images
+            if images is None:
+                layout = discover()
+                images = layout.train_images
+            if images is None or not Path(images).is_dir():
+                ap.error(
+                    "could not locate the training images; pass --images explicitly "
+                    "(expected <root>/train_series/<StudyInstanceUID>/<SeriesInstanceUID>/*.dcm)"
+                )
+            images = Path(images)
+            print(f"training images: {images}")
+
+            def load_fn(uid: str):
+                return load_study(images / uid, out_size=args.image_size)
 
     available = sorted(int(f) for f in np.unique(fold_of))
     if args.fold not in available:
