@@ -244,11 +244,17 @@ def main() -> int:
     # the first conv as cuDNN's "GET was unable to find an engine to execute
     # this computation", which reads like a broken install rather than an
     # unsupported dtype.  Downgrade loudly instead.
-    if args.amp == "bf16" and str(args.device).startswith("cuda"):
-        if not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
-            name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "?"
-            print(f"!! {name} does not support bf16; using fp16 instead "
-                  "(pass --amp fp32 to disable mixed precision)")
+    if str(args.device).startswith("cuda") and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(0)
+        name = torch.cuda.get_device_name(0)
+        print(f"device: {name} (sm_{major}{minor})")
+        # NOT ``torch.cuda.is_bf16_supported()``: since torch 2.6 that takes
+        # ``including_emulation=True`` by default and answers True on a T4,
+        # where cuDNN has no bf16 convolution kernel at all.  The question that
+        # matters is the compute capability -- bf16 convs need sm_80+.
+        if args.amp == "bf16" and major < 8:
+            print(f"!! {name} has no bf16 convolution kernels (needs sm_80+); "
+                  "using fp16 instead (pass --amp fp32 to disable mixed precision)")
             args.amp = "fp16"
 
     torch.manual_seed(args.seed)
